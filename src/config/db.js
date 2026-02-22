@@ -11,6 +11,8 @@ const pool = new Pool({
   max: 10,                  // max conexiones en el pool
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
+    // ✅ SSL solo en producción
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
 pool.on('error', (err) => {
