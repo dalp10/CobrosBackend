@@ -167,9 +167,8 @@ async function seed() {
       { fecha:'2025-10-26', monto:15,   metodo:'yape',     op:'24832056', concepto:'Abono Yape' },
       { fecha:'2025-10-26', monto:135,  metodo:'yape',     op:'24949372', concepto:'Abono Yape' },
       { fecha:'2025-11-24', monto:150,  metodo:'yape',     op:'19321300', concepto:'Abono Yape' },
+      // ✅ AGREGADO: Yape 14/12/2025 op.10499925 (faltaba)
       { fecha:'2025-12-14', monto:150,  metodo:'yape',     op:'10499925', concepto:'Abono Yape' },
-      { fecha:'2025-12-19', monto:300,  metodo:'yape',     op:'21363725', concepto:'Abono Yape' },
-      { fecha:'2025-12-19', monto:200,  metodo:'yape',     op:'25872899', concepto:'Abono Yape' },
       { fecha:'2026-01-11', monto:200,  metodo:'yape',     op:'19714059', concepto:'Abono Yape' },
       { fecha:'2026-02-01', monto:200,  metodo:'yape',     op:'14869100', concepto:'Abono Yape' },
     ];
@@ -190,6 +189,9 @@ async function seed() {
       { fecha:'2025-08-01', monto:600, metodo:'transferencia', op:'05393006', concepto:'Pago Interbank', banco:'Interbank' },
       { fecha:'2025-09-05', monto:300, metodo:'yape',          op:'18593202', concepto:'Pago Yape' },
       { fecha:'2025-10-10', monto:500, metodo:'yape',          op:'10957101', concepto:'Pago Yape' },
+      // ✅ AGREGADOS: 2 Yapes del 19/12/2025 que faltaban
+      { fecha:'2025-12-19', monto:300, metodo:'yape',          op:'21363725', concepto:'Pago Yape' },
+      { fecha:'2025-12-19', monto:200, metodo:'yape',          op:'25872899', concepto:'Pago Yape' },
       { fecha:'2026-02-05', monto:500, metodo:'efectivo',      op:'-',        concepto:'Pago #11 efectivo' },
     ];
     for (const p of pagosMiguel) {
