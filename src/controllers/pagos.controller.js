@@ -1,6 +1,7 @@
 // src/controllers/pagos.controller.js
 const { query, getClient } = require('../config/db');
 const path = require('path');
+const fs = require('fs');
 
 // GET /pagos?deudor_id=&prestamo_id=&metodo=&desde=&hasta=
 const getAll = async (req, res) => {
@@ -105,22 +106,73 @@ const create = async (req, res) => {
   }
 };
 
-// PUT /pagos/:id
+// PUT /pagos/:id — actualizar pago (con imagen opcional vía multer)
 const update = async (req, res) => {
   const { id } = req.params;
-  const { fecha_pago, monto, metodo_pago, numero_operacion, banco_origen, concepto, notas } = req.body;
+  const { fecha_pago, monto, metodo_pago, numero_operacion, banco_origen, concepto, notas, remove_imagen } = req.body;
+
   try {
+    // Obtener pago actual para manejar imagen vieja
+    const { rows: [pagoActual] } = await query('SELECT * FROM pagos WHERE id = $1', [id]);
+    if (!pagoActual) return res.status(404).json({ error: 'Pago no encontrado' });
+
+    let imagen_url    = pagoActual.imagen_url;
+    let imagen_nombre = pagoActual.imagen_nombre;
+
+    // Helper: intentar borrar archivo viejo sin lanzar error si no existe
+    const tryDeleteOld = (oldUrl) => {
+      if (!oldUrl) return;
+      try {
+        // Intentar rutas comunes donde puede estar la carpeta uploads
+        const candidates = [
+          path.join(__dirname, '../../public', oldUrl),
+          path.join(__dirname, '../public', oldUrl),
+          path.join(__dirname, '../../', oldUrl),
+          path.join(__dirname, '../', oldUrl),
+          path.join(process.cwd(), 'public', oldUrl),
+          path.join(process.cwd(), oldUrl.replace(/^\//, '')),
+        ];
+        for (const p of candidates) {
+          if (fs.existsSync(p)) { fs.unlinkSync(p); break; }
+        }
+      } catch (e) {
+        console.warn('No se pudo eliminar imagen vieja:', e.message);
+      }
+    };
+
+    // Si se sube nueva imagen, reemplazar
+    if (req.file) {
+      tryDeleteOld(pagoActual.imagen_url);
+      imagen_url    = `/uploads/${req.file.filename}`;
+      imagen_nombre = req.file.originalname;
+    }
+    // Si se pidió eliminar la imagen sin subir una nueva
+    else if (remove_imagen === 'true') {
+      tryDeleteOld(pagoActual.imagen_url);
+      imagen_url    = null;
+      imagen_nombre = null;
+    }
+
     const { rows: [row] } = await query(`
       UPDATE pagos SET
         fecha_pago=$1, monto=$2, metodo_pago=$3,
         numero_operacion=$4, banco_origen=$5,
-        concepto=$6, notas=$7
-      WHERE id=$8 RETURNING *
-    `, [fecha_pago, monto, metodo_pago, numero_operacion, banco_origen, concepto, notas, id]);
+        concepto=$6, notas=$7,
+        imagen_url=$8, imagen_nombre=$9
+      WHERE id=$10 RETURNING *
+    `, [
+      fecha_pago, parseFloat(monto), metodo_pago,
+      numero_operacion || null, banco_origen || null,
+      concepto || null, notas || null,
+      imagen_url, imagen_nombre,
+      id
+    ]);
+
     if (!row) return res.status(404).json({ error: 'Pago no encontrado' });
     res.json(row);
   } catch (err) {
-    res.status(500).json({ error: 'Error al actualizar pago' });
+    console.error('Error en PUT /pagos/:id →', err);
+    res.status(500).json({ error: 'Error al actualizar pago', detalle: err.message });
   }
 };
 
@@ -128,9 +180,17 @@ const update = async (req, res) => {
 const remove = async (req, res) => {
   const { id } = req.params;
   try {
+    // Eliminar imagen del disco si existe
+    const { rows: [pago] } = await query('SELECT imagen_url FROM pagos WHERE id = $1', [id]);
+    if (pago?.imagen_url) {
+      const filePath = path.join(__dirname, '../../public', pago.imagen_url);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+
     await query('DELETE FROM pagos WHERE id = $1', [id]);
     res.json({ message: 'Pago eliminado' });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Error al eliminar pago' });
   }
 };

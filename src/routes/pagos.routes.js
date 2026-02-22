@@ -8,7 +8,7 @@ router.use(auth);
 router.get('/resumen', ctrl.resumen);
 router.get('/',        ctrl.getAll);
 router.post('/',       upload.single('imagen'), ctrl.create);
-router.put('/:id',     ctrl.update);
+router.put('/:id',     upload.single('imagen'), ctrl.update);
 router.delete('/:id',  ctrl.remove);
 
 module.exports = router;
