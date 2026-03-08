@@ -2,15 +2,30 @@ const bcrypt = require('bcryptjs');
 const { query } = require('../config/db');
 
 // GET /usuarios - solo admin
+// Compatible con y sin columna activo (si no existe, se omite o se añade por defecto).
 const getAll = async (req, res) => {
   if (req.user.rol !== 'admin')
     return res.status(403).json({ error: 'Solo administradores' });
   try {
-    const { rows } = await query(
-      'SELECT id, nombre, email, rol, activo, created_at FROM usuarios ORDER BY created_at DESC'
-    );
+    let rows;
+    try {
+      const r = await query(
+        'SELECT id, nombre, email, rol, activo, created_at FROM usuarios ORDER BY created_at DESC'
+      );
+      rows = r.rows;
+    } catch (colErr) {
+      if (colErr.code === '42703') {
+        const r = await query(
+          'SELECT id, nombre, email, rol, created_at FROM usuarios ORDER BY created_at DESC'
+        );
+        rows = r.rows.map(u => ({ ...u, activo: true }));
+      } else {
+        throw colErr;
+      }
+    }
     res.json(rows);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Error al obtener usuarios' });
   }
 };
@@ -39,16 +54,31 @@ const create = async (req, res) => {
 };
 
 // PUT /usuarios/:id - editar
+// Si la tabla no tiene columna activo, se omite en el UPDATE.
 const update = async (req, res) => {
   if (req.user.rol !== 'admin')
     return res.status(403).json({ error: 'Solo administradores' });
   const { id } = req.params;
   const { nombre, email, rol, activo } = req.body;
   try {
-    const { rows: [user] } = await query(
-      'UPDATE usuarios SET nombre=$1, email=$2, rol=$3, activo=$4 WHERE id=$5 RETURNING id, nombre, email, rol, activo',
-      [nombre, email, rol, activo !== undefined ? activo : true, id]
-    );
+    let user;
+    try {
+      const r = await query(
+        'UPDATE usuarios SET nombre=$1, email=$2, rol=$3, activo=$4 WHERE id=$5 RETURNING id, nombre, email, rol, activo, created_at',
+        [nombre, email, rol || 'admin', activo !== undefined ? activo : true, id]
+      );
+      user = r.rows[0];
+    } catch (colErr) {
+      if (colErr.code === '42703') {
+        const r = await query(
+          'UPDATE usuarios SET nombre=$1, email=$2, rol=$3 WHERE id=$4 RETURNING id, nombre, email, rol, created_at',
+          [nombre, email, rol || 'admin', id]
+        );
+        user = r.rows[0] ? { ...r.rows[0], activo: activo !== undefined ? activo : true } : null;
+      } else {
+        throw colErr;
+      }
+    }
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
     res.json(user);
   } catch (err) {

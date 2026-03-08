@@ -1,12 +1,29 @@
 // src/controllers/deudores.controller.js
 const { query } = require('../config/db');
 
-// GET /deudores — lista con resumen financiero
+// GET /deudores — lista con resumen financiero (una fila por persona; agrupa duplicados por nombre+apellidos)
+const DEUDORES_LIMIT_MAX = 200;
+
 const getAll = async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limitRaw = parseInt(req.query.limit) || DEUDORES_LIMIT_MAX;
+  const limit = Math.min(Math.max(1, limitRaw), DEUDORES_LIMIT_MAX);
+  const offset = (page - 1) * limit;
+
   try {
     const { rows } = await query(`
       SELECT
-        d.*,
+        MIN(d.id) AS id,
+        d.nombre,
+        d.apellidos,
+        MAX(d.dni) AS dni,
+        MAX(d.telefono) AS telefono,
+        MAX(d.email) AS email,
+        MAX(d.direccion) AS direccion,
+        MAX(d.notas) AS notas,
+        BOOL_OR(d.activo) AS activo,
+        MIN(d.created_at) AS created_at,
+        MIN(d.updated_at) AS updated_at,
         COALESCE(SUM(p.monto), 0)                          AS total_pagado,
         COALESCE(SUM(pr.monto_original), 0)                AS total_prestado,
         COALESCE(SUM(pr.monto_original), 0)
@@ -17,10 +34,18 @@ const getAll = async (req, res) => {
       LEFT JOIN prestamos pr ON pr.deudor_id = d.id
       LEFT JOIN pagos p      ON p.deudor_id  = d.id
       WHERE d.activo = true
-      GROUP BY d.id
-      ORDER BY d.apellidos, d.nombre;
+      GROUP BY d.nombre, d.apellidos
+      ORDER BY d.apellidos, d.nombre
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+
+    const { rows: [{ total }] } = await query(`
+      SELECT COUNT(*) AS total FROM (
+        SELECT 1 FROM deudores WHERE activo = true GROUP BY nombre, apellidos
+      ) t
     `);
-    res.json(rows);
+
+    res.json({ data: rows, total: parseInt(total), page, limit });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al obtener deudores' });

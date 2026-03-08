@@ -6,7 +6,7 @@ const authMiddleware = (req, res, next) => {
   const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
 
   if (!token) {
-    return res.status(401).json({ error: 'Token requerido' });
+    return res.status(401).json({ error: 'Token requerido', code: 'TOKEN_MISSING' });
   }
 
   try {
@@ -14,7 +14,11 @@ const authMiddleware = (req, res, next) => {
     req.user = decoded;
     next();
   } catch (err) {
-    return res.status(403).json({ error: 'Token inválido o expirado' });
+    const isExpired = err.name === 'TokenExpiredError';
+    return res.status(401).json({
+      error: isExpired ? 'Token expirado' : 'Token inválido',
+      code: isExpired ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID',
+    });
   }
 };
 

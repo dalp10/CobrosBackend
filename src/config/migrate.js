@@ -23,8 +23,12 @@ const createTables = async () => {
         email       VARCHAR(150) UNIQUE NOT NULL,
         password    VARCHAR(255) NOT NULL,
         rol         VARCHAR(20) DEFAULT 'admin',
+        activo      BOOLEAN DEFAULT true,
         created_at  TIMESTAMPTZ DEFAULT NOW()
       );
+    `);
+    await client.query(`
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT true;
     `);
 
     // ── DEUDORES ─────────────────────────────────────────────────

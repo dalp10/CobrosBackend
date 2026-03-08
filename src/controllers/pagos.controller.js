@@ -1,7 +1,6 @@
 // src/controllers/pagos.controller.js
 const { query, getClient } = require('../config/db');
-const path = require('path');
-const fs = require('fs');
+const { tryDeleteUpload } = require('../utils/uploads');
 
 // GET /pagos?deudor_id=&prestamo_id=&metodo=&desde=&hasta=
 const getAll = async (req, res) => {
@@ -119,36 +118,12 @@ const update = async (req, res) => {
     let imagen_url    = pagoActual.imagen_url;
     let imagen_nombre = pagoActual.imagen_nombre;
 
-    // Helper: intentar borrar archivo viejo sin lanzar error si no existe
-    const tryDeleteOld = (oldUrl) => {
-      if (!oldUrl) return;
-      try {
-        // Intentar rutas comunes donde puede estar la carpeta uploads
-        const candidates = [
-          path.join(__dirname, '../../public', oldUrl),
-          path.join(__dirname, '../public', oldUrl),
-          path.join(__dirname, '../../', oldUrl),
-          path.join(__dirname, '../', oldUrl),
-          path.join(process.cwd(), 'public', oldUrl),
-          path.join(process.cwd(), oldUrl.replace(/^\//, '')),
-        ];
-        for (const p of candidates) {
-          if (fs.existsSync(p)) { fs.unlinkSync(p); break; }
-        }
-      } catch (e) {
-        console.warn('No se pudo eliminar imagen vieja:', e.message);
-      }
-    };
-
-    // Si se sube nueva imagen, reemplazar
     if (req.file) {
-      tryDeleteOld(pagoActual.imagen_url);
+      tryDeleteUpload(pagoActual.imagen_url);
       imagen_url    = `/uploads/${req.file.filename}`;
       imagen_nombre = req.file.originalname;
-    }
-    // Si se pidió eliminar la imagen sin subir una nueva
-    else if (remove_imagen === 'true') {
-      tryDeleteOld(pagoActual.imagen_url);
+    } else if (remove_imagen === 'true') {
+      tryDeleteUpload(pagoActual.imagen_url);
       imagen_url    = null;
       imagen_nombre = null;
     }
@@ -172,7 +147,11 @@ const update = async (req, res) => {
     res.json(row);
   } catch (err) {
     console.error('Error en PUT /pagos/:id →', err);
-    res.status(500).json({ error: 'Error al actualizar pago', detalle: err.message });
+    const isProd = process.env.NODE_ENV === 'production';
+    res.status(500).json({
+      error: 'Error al actualizar pago',
+      ...(isProd ? {} : { detalle: err.message }),
+    });
   }
 };
 
@@ -180,12 +159,8 @@ const update = async (req, res) => {
 const remove = async (req, res) => {
   const { id } = req.params;
   try {
-    // Eliminar imagen del disco si existe
     const { rows: [pago] } = await query('SELECT imagen_url FROM pagos WHERE id = $1', [id]);
-    if (pago?.imagen_url) {
-      const filePath = path.join(__dirname, '../../public', pago.imagen_url);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    }
+    if (pago?.imagen_url) tryDeleteUpload(pago.imagen_url);
 
     await query('DELETE FROM pagos WHERE id = $1', [id]);
     res.json({ message: 'Pago eliminado' });
