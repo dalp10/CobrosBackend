@@ -9,7 +9,8 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "db:migrate": "node src/config/migrate.js",
-    "db:seed": "node src/config/seed.js"
+    "db:seed": "node src/config/seed.js",
+    "db:clean-duplicates": "node scripts/clean-duplicate-data.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -22,7 +23,8 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
     "pg": "^8.11.3",
-    "sharp": "^0.33.3"
+    "sharp": "^0.33.3",
+    "twilio": "^5.12.2"
   },
   "devDependencies": {
     "jest": "^29.7.0",

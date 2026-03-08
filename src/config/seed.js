@@ -25,23 +25,23 @@ async function seed() {
 
     // ── DEUDORES ─────────────────────────────────────────────────
     const { rows: [maritza] } = await client.query(`
-      INSERT INTO deudores (nombre, apellidos, notas)
-      VALUES ('Maritza', 'Paredes Piña', 'Préstamo BanBif + Pandero activo')
+      INSERT INTO deudores (nombre, apellidos, telefono, notas)
+      VALUES ('Maritza', 'Paredes Piña', '981844013', 'Préstamo BanBif + Pandero activo')
       ON CONFLICT DO NOTHING RETURNING id;
     `);
     const { rows: [pedro] } = await client.query(`
-      INSERT INTO deudores (nombre, apellidos, notas)
-      VALUES ('Pedro', 'Reátegui Carpi', 'Préstamo personal')
+      INSERT INTO deudores (nombre, apellidos, telefono, notas)
+      VALUES ('Pedro', 'Reátegui Carpi', '953154506', 'Préstamo personal')
       ON CONFLICT DO NOTHING RETURNING id;
     `);
     const { rows: [miguel] } = await client.query(`
-      INSERT INTO deudores (nombre, apellidos, notas)
-      VALUES ('Miguel', 'Ríos', 'Cuotas variables registradas en cuaderno')
+      INSERT INTO deudores (nombre, apellidos, telefono, notas)
+      VALUES ('Miguel', 'Ríos', '974254761', 'Cuotas variables registradas en cuaderno')
       ON CONFLICT DO NOTHING RETURNING id;
     `);
     const { rows: [annie] } = await client.query(`
-      INSERT INTO deudores (nombre, apellidos, notas)
-      VALUES ('Annie', 'Muñoz', 'Pagos vía Interbank')
+      INSERT INTO deudores (nombre, apellidos, telefono, notas)
+      VALUES ('Annie', 'Muñoz', '992088181', 'Pagos vía Interbank')
       ON CONFLICT DO NOTHING RETURNING id;
     `);
 

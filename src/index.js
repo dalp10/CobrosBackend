@@ -55,6 +55,7 @@ app.use('/api/deudores',  require('./routes/deudores.routes'));
 app.use('/api/prestamos', require('./routes/prestamos.routes'));
 app.use('/api/usuarios',  require('./routes/usuarios.routes'));
 app.use('/api/pagos',     require('./routes/pagos.routes'));
+app.use('/api/alertas',   require('./routes/alertas.routes'));
 
 // ── Health check ───────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
