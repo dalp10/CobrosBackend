@@ -116,6 +116,154 @@ const createTables = async () => {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_cuotas_prestamo ON cuotas(prestamo_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_prestamos_deudor ON prestamos(deudor_id);`);
 
+    // ── REPARTO DE GASTOS (casa: servicios agua, luz, etc. entre varios) ───
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_miembros (
+        id         SERIAL PRIMARY KEY,
+        nombre     VARCHAR(150) NOT NULL,
+        activo     BOOLEAN DEFAULT true,
+        cargo_adicional_mensual NUMERIC(12,2) DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await client.query(`
+      ALTER TABLE reparto_miembros ADD COLUMN IF NOT EXISTS cargo_adicional_mensual NUMERIC(12,2) DEFAULT 0;
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_gastos (
+        id            SERIAL PRIMARY KEY,
+        concepto      VARCHAR(255) NOT NULL,
+        monto_total   NUMERIC(12,2) NOT NULL CHECK (monto_total > 0),
+        fecha         DATE NOT NULL DEFAULT CURRENT_DATE,
+        pagado_por_id INTEGER NOT NULL REFERENCES reparto_miembros(id) ON DELETE RESTRICT,
+        notas         TEXT,
+        anulado       BOOLEAN DEFAULT false,
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS anulado BOOLEAN DEFAULT false;`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_reembolsos (
+        id              SERIAL PRIMARY KEY,
+        de_miembro_id   INTEGER NOT NULL REFERENCES reparto_miembros(id) ON DELETE RESTRICT,
+        para_miembro_id INTEGER NOT NULL REFERENCES reparto_miembros(id) ON DELETE RESTRICT,
+        monto           NUMERIC(12,2) NOT NULL CHECK (monto > 0),
+        fecha           DATE NOT NULL DEFAULT CURRENT_DATE,
+        concepto        VARCHAR(255),
+        notas           TEXT,
+        anulado         BOOLEAN DEFAULT false,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        CHECK (de_miembro_id != para_miembro_id)
+      );
+    `);
+    await client.query(`ALTER TABLE reparto_reembolsos ADD COLUMN IF NOT EXISTS anulado BOOLEAN DEFAULT false;`);
+    await client.query(`ALTER TABLE reparto_reembolsos ADD COLUMN IF NOT EXISTS gasto_id INTEGER;`);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'reparto_reembolsos_gasto_id_fkey'
+        ) THEN
+          ALTER TABLE reparto_reembolsos
+          ADD CONSTRAINT reparto_reembolsos_gasto_id_fkey
+          FOREIGN KEY (gasto_id) REFERENCES reparto_gastos(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_gastos_pagado ON reparto_gastos(pagado_por_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_gastos_fecha ON reparto_gastos(fecha);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_reemb_de ON reparto_reembolsos(de_miembro_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_reemb_para ON reparto_reembolsos(para_miembro_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_reemb_gasto ON reparto_reembolsos(gasto_id);`);
+
+    // ── REPARTO: categorías de gastos ─────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_categorias (
+        id    SERIAL PRIMARY KEY,
+        nombre VARCHAR(100) NOT NULL,
+        color  VARCHAR(20) DEFAULT '#6b7280'
+      );
+    `);
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS categoria_id INTEGER REFERENCES reparto_categorias(id) ON DELETE SET NULL;`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_gastos_categoria ON reparto_gastos(categoria_id);`);
+
+    // ── REPARTO: división custom por gasto (pesos por participante) ─
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_gasto_participantes (
+        gasto_id   INTEGER NOT NULL REFERENCES reparto_gastos(id) ON DELETE CASCADE,
+        miembro_id INTEGER NOT NULL REFERENCES reparto_miembros(id) ON DELETE CASCADE,
+        peso       NUMERIC(12,4) NOT NULL DEFAULT 1 CHECK (peso > 0),
+        PRIMARY KEY (gasto_id, miembro_id)
+      );
+    `);
+
+    // ── REPARTO: presupuesto por mes ──────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_presupuestos (
+        id          SERIAL PRIMARY KEY,
+        anno        INTEGER NOT NULL,
+        mes         INTEGER NOT NULL CHECK (mes >= 1 AND mes <= 12),
+        monto_techo NUMERIC(12,2) NOT NULL CHECK (monto_techo >= 0),
+        UNIQUE(anno, mes)
+      );
+    `);
+
+    // ── REPARTO: gastos recurrentes ────────────────────────────────
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS recurrente BOOLEAN DEFAULT false;`);
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS recurrente_origen_id INTEGER REFERENCES reparto_gastos(id) ON DELETE SET NULL;`);
+
+    // ── REPARTO: adjuntos (fotos/PDF por gasto) ──────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_adjuntos (
+        id            SERIAL PRIMARY KEY,
+        gasto_id      INTEGER NOT NULL REFERENCES reparto_gastos(id) ON DELETE CASCADE,
+        nombre_archivo VARCHAR(255) NOT NULL,
+        ruta          VARCHAR(500) NOT NULL,
+        content_type  VARCHAR(100) DEFAULT 'application/octet-stream',
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_adjuntos_gasto ON reparto_adjuntos(gasto_id);`);
+
+    // ── REPARTO: múltiples grupos ────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_grupos (
+        id     SERIAL PRIMARY KEY,
+        nombre VARCHAR(150) NOT NULL
+      );
+    `);
+    await client.query(`INSERT INTO reparto_grupos (id, nombre) VALUES (1, 'Principal') ON CONFLICT (id) DO NOTHING;`);
+    await client.query(`ALTER TABLE reparto_miembros ADD COLUMN IF NOT EXISTS reparto_id INTEGER REFERENCES reparto_grupos(id) ON DELETE CASCADE DEFAULT 1;`);
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS reparto_id INTEGER REFERENCES reparto_grupos(id) ON DELETE CASCADE DEFAULT 1;`);
+    await client.query(`ALTER TABLE reparto_reembolsos ADD COLUMN IF NOT EXISTS reparto_id INTEGER REFERENCES reparto_grupos(id) ON DELETE CASCADE DEFAULT 1;`);
+    await client.query(`ALTER TABLE reparto_presupuestos ADD COLUMN IF NOT EXISTS reparto_id INTEGER REFERENCES reparto_grupos(id) ON DELETE CASCADE DEFAULT 1;`);
+    await client.query(`ALTER TABLE reparto_categorias ADD COLUMN IF NOT EXISTS reparto_id INTEGER REFERENCES reparto_grupos(id) ON DELETE CASCADE DEFAULT 1;`);
+
+    // ── REPARTO: medio de pago en gastos y reembolsos + adjuntos en reembolsos ─
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS medio_pago VARCHAR(30);`);
+    await client.query(`ALTER TABLE reparto_reembolsos ADD COLUMN IF NOT EXISTS medio_pago VARCHAR(30);`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_reembolso_adjuntos (
+        id            SERIAL PRIMARY KEY,
+        reembolso_id  INTEGER NOT NULL REFERENCES reparto_reembolsos(id) ON DELETE CASCADE,
+        nombre_archivo VARCHAR(255) NOT NULL,
+        ruta          VARCHAR(500) NOT NULL,
+        content_type  VARCHAR(100) DEFAULT 'application/octet-stream',
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_reembolso_adjuntos ON reparto_reembolso_adjuntos(reembolso_id);`);
+
+    const { rows: [{ count }] } = await client.query(`SELECT COUNT(*)::int AS count FROM reparto_miembros`);
+    if (count === 0) {
+      await client.query(`
+        INSERT INTO reparto_miembros (nombre) VALUES
+          ('Willy López'),
+          ('Alain López'),
+          ('Dayer López')
+      `);
+    }
+
     // ── FUNCIÓN auto-update updated_at ───────────────────────────
     await client.query(`
       CREATE OR REPLACE FUNCTION update_updated_at()

@@ -42,6 +42,12 @@ app.use(express.urlencoded({ extended: true }));
 const { apiLimiter } = require('./middleware/rateLimit');
 app.use('/api', (req, res, next) => {
   if (req.path === '/health') return next();
+  // Normalizar barra final: /reparto/miembros/3/ → /reparto/miembros/3 (req.url es relativo a /api)
+  if (req.url.endsWith('/') && req.url !== '/') {
+    const [pathOnly, query] = req.url.split('?');
+    const trimmed = pathOnly.replace(/\/+$/, '') || '/';
+    req.url = query ? trimmed + '?' + query : trimmed;
+  }
   return apiLimiter(req, res, next);
 });
 
@@ -56,6 +62,7 @@ app.use('/api/prestamos', require('./routes/prestamos.routes'));
 app.use('/api/usuarios',  require('./routes/usuarios.routes'));
 app.use('/api/pagos',     require('./routes/pagos.routes'));
 app.use('/api/alertas',   require('./routes/alertas.routes'));
+app.use('/api/reparto',   require('./routes/reparto.routes'));
 
 // ── Health check ───────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
