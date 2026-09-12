@@ -1,5 +1,6 @@
 // src/config/db.js
 const { Pool } = require('pg');
+const logger = require('./logger');
 require('dotenv').config();
 
 const pool = new Pool({
@@ -16,7 +17,7 @@ const pool = new Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('❌ Error inesperado en el pool de PostgreSQL:', err);
+  logger.error({ err }, '❌ Error inesperado en el pool de PostgreSQL');
 });
 
 // Helper para queries más limpias

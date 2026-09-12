@@ -1,6 +1,7 @@
 // src/middleware/validateRepartoId.js
 // Valida que reparto_id (query o body) exista en reparto_grupos cuando se envía.
 const { query } = require('../config/db');
+const logger = require('../config/logger');
 
 async function validateRepartoId(req, res, next) {
   const repartoIdRaw = req.query.reparto_id ?? req.body?.reparto_id;
@@ -14,7 +15,7 @@ async function validateRepartoId(req, res, next) {
       return res.status(404).json({ error: 'Reparto no encontrado' });
     next();
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al validar reparto' });
   }
 }

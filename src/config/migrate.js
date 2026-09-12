@@ -43,9 +43,21 @@ const createTables = async () => {
         direccion       TEXT,
         notas           TEXT,
         activo          BOOLEAN DEFAULT true,
+        fecha_compromiso_pago DATE,
+        monto_compromiso_pago NUMERIC(12,2),
+        notas_compromiso TEXT,
         created_at      TIMESTAMPTZ DEFAULT NOW(),
         updated_at      TIMESTAMPTZ DEFAULT NOW()
       );
+    `);
+    await client.query(`
+      ALTER TABLE deudores ADD COLUMN IF NOT EXISTS fecha_compromiso_pago DATE;
+    `);
+    await client.query(`
+      ALTER TABLE deudores ADD COLUMN IF NOT EXISTS monto_compromiso_pago NUMERIC(12,2);
+    `);
+    await client.query(`
+      ALTER TABLE deudores ADD COLUMN IF NOT EXISTS notas_compromiso TEXT;
     `);
 
     // ── PRÉSTAMOS ─────────────────────────────────────────────────
@@ -85,6 +97,12 @@ const createTables = async () => {
         created_at      TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(prestamo_id, numero_cuota)
       );
+    `);
+    await client.query(`
+      ALTER TABLE cuotas ADD COLUMN IF NOT EXISTS monto_capital NUMERIC(12,2) DEFAULT 0;
+    `);
+    await client.query(`
+      ALTER TABLE cuotas ADD COLUMN IF NOT EXISTS monto_interes NUMERIC(12,2) DEFAULT 0;
     `);
 
     // ── PAGOS (registros reales de dinero recibido) ──────────────
@@ -212,6 +230,48 @@ const createTables = async () => {
     await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS recurrente BOOLEAN DEFAULT false;`);
     await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS recurrente_origen_id INTEGER REFERENCES reparto_gastos(id) ON DELETE SET NULL;`);
 
+    // ── REPARTO: gastos en borrador (pendientes de pago) ─────────────
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS estado VARCHAR(20) NOT NULL DEFAULT 'confirmado';`);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'chk_reparto_gastos_estado'
+        ) THEN
+          ALTER TABLE reparto_gastos
+          ADD CONSTRAINT chk_reparto_gastos_estado CHECK (estado IN ('borrador', 'confirmado'));
+        END IF;
+      END $$;
+    `);
+
+    // ── REPARTO: fecha de corte y fecha de vencimiento por gasto ─────
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS fecha_corte DATE;`);
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE;`);
+
+    // ── REPARTO: cuántos meses cubre el recibo (para recibos bimestrales, etc.) ─
+    await client.query(`ALTER TABLE reparto_gastos ADD COLUMN IF NOT EXISTS meses INTEGER NOT NULL DEFAULT 1;`);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'chk_reparto_gastos_meses'
+        ) THEN
+          ALTER TABLE reparto_gastos
+          ADD CONSTRAINT chk_reparto_gastos_meses CHECK (meses >= 1);
+        END IF;
+      END $$;
+    `);
+
+    // ── REPARTO: cargos adicionales asociados a un gasto específico ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reparto_gasto_cargos (
+        gasto_id   INTEGER NOT NULL REFERENCES reparto_gastos(id) ON DELETE CASCADE,
+        miembro_id INTEGER NOT NULL REFERENCES reparto_miembros(id) ON DELETE CASCADE,
+        monto      NUMERIC(12,2) NOT NULL CHECK (monto > 0),
+        PRIMARY KEY (gasto_id, miembro_id)
+      );
+    `);
+
     // ── REPARTO: adjuntos (fotos/PDF por gasto) ──────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS reparto_adjuntos (
@@ -253,6 +313,9 @@ const createTables = async () => {
       );
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_reparto_reembolso_adjuntos ON reparto_reembolso_adjuntos(reembolso_id);`);
+
+    // ── PAGOS: detalle de cómo se repartió el pago sobre el cronograma de cuotas ─
+    await client.query(`ALTER TABLE pagos ADD COLUMN IF NOT EXISTS cuotas_aplicadas JSONB;`);
 
     const { rows: [{ count }] } = await client.query(`SELECT COUNT(*)::int AS count FROM reparto_miembros`);
     if (count === 0) {

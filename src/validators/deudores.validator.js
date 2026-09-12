@@ -19,6 +19,9 @@ const createDeudorValidations = [
   body('email').optional().trim().isEmail().withMessage('Email inválido'),
   body('direccion').optional().trim().isLength({ max: 255 }),
   body('notas').optional().trim().isLength({ max: 500 }),
+  body('fecha_compromiso_pago').optional().isISO8601().withMessage('Fecha de compromiso inválida'),
+  body('monto_compromiso_pago').optional().isFloat({ min: 0 }).withMessage('Monto de compromiso debe ser ≥ 0'),
+  body('notas_compromiso').optional().trim().isLength({ max: 500 }),
 ];
 
 const updateDeudorValidations = [
@@ -30,6 +33,9 @@ const updateDeudorValidations = [
   body('direccion').optional().trim().isLength({ max: 255 }),
   body('notas').optional().trim().isLength({ max: 500 }),
   body('activo').optional().isBoolean(),
+  body('fecha_compromiso_pago').optional().isISO8601().withMessage('Fecha de compromiso inválida'),
+  body('monto_compromiso_pago').optional().isFloat({ min: 0 }).withMessage('Monto de compromiso debe ser ≥ 0'),
+  body('notas_compromiso').optional().trim().isLength({ max: 500 }),
 ];
 
 module.exports = { createDeudorValidations, updateDeudorValidations };

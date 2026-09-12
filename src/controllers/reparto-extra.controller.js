@@ -1,5 +1,6 @@
 // src/controllers/reparto-extra.controller.js — Categorías, pendientes, presupuestos, Excel, repetir gasto, adjuntos, grupos
 const path = require('path');
+const logger = require('../config/logger');
 const fs = require('fs');
 const { query } = require('../config/db');
 const ExcelJS = require('exceljs');
@@ -24,7 +25,7 @@ const getCategorias = async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar categorías' });
   }
 };
@@ -57,7 +58,7 @@ const createCategoria = async (req, res) => {
     );
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al crear categoría' });
   }
 };
@@ -110,7 +111,7 @@ const updateCategoria = async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Categoría no encontrada' });
     res.json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al actualizar categoría' });
   }
 };
@@ -122,7 +123,7 @@ const deleteCategoria = async (req, res) => {
     if (rowCount === 0) return res.status(404).json({ error: 'Categoría no encontrada' });
     res.json({ message: 'Categoría eliminada' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al eliminar categoría' });
   }
 };
@@ -142,7 +143,7 @@ const getPendientes = async (req, res) => {
     }
     res.json({ miembros_que_deben: miembrosQueDeben, gastos_sin_reembolso: gastosSinReembolso });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al obtener pendientes' });
   }
 };
@@ -159,7 +160,7 @@ const getPresupuestos = async (req, res) => {
     const { rows } = await query(sql, params);
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar presupuestos' });
   }
 };
@@ -197,7 +198,7 @@ const createPresupuesto = async (req, res) => {
     );
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al guardar presupuesto' });
   }
 };
@@ -217,7 +218,7 @@ const updatePresupuesto = async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Presupuesto no encontrado' });
     res.json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al actualizar presupuesto' });
   }
 };
@@ -229,7 +230,7 @@ const deletePresupuesto = async (req, res) => {
     if (rowCount === 0) return res.status(404).json({ error: 'Presupuesto no encontrado' });
     res.json({ message: 'Presupuesto eliminado' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al eliminar presupuesto' });
   }
 };
@@ -264,13 +265,34 @@ const exportarReporteExcel = async (req, res) => {
     sheet.addRow({ seccion: 'Reembolsos', d1: 'De → Para', d2: 'Monto', d3: 'Fecha' });
     data.reembolsos.forEach(r => sheet.addRow({ seccion: '', d1: `${r.de_nombre} → ${r.para_nombre}`, d2: r.monto, d3: r.fecha }));
 
+    if (data.sugerencias_reembolso?.length) {
+      sheet.addRow({});
+      sheet.addRow({ seccion: 'Quién le debe a quién (sugerencias)', d1: 'De', d2: 'Para', d3: 'Monto' });
+      data.sugerencias_reembolso.forEach(s => sheet.addRow({ seccion: '', d1: s.de_nombre, d2: s.para_nombre, d3: s.monto }));
+    }
+
+    if (data.desglose_por_categoria?.length) {
+      sheet.addRow({});
+      sheet.addRow({ seccion: 'Gastos por categoría', d1: 'Categoría', d2: 'Total' });
+      data.desglose_por_categoria.forEach(c => sheet.addRow({ seccion: '', d1: c.nombre, d2: c.total }));
+    }
+
+    if (data.resumen_por_mes?.length) {
+      sheet.addRow({});
+      sheet.addRow({ seccion: 'Resumen por mes', d1: 'Mes', d2: 'Total', d3: 'Cuota por persona' });
+      data.resumen_por_mes.forEach(item => {
+        sheet.addRow({ seccion: '', d1: item.mes, d2: item.total, d3: item.cuota_por_persona });
+        item.cuotas.forEach(c => sheet.addRow({ seccion: '', d1: '', d2: c.nombre, d3: c.cuota }));
+      });
+    }
+
     const buf = await workbook.xlsx.writeBuffer();
     const filename = `reparto-${data.desde || 'todo'}-${data.hasta || 'todo'}.xlsx`;
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(buf);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al generar Excel' });
   }
 };
@@ -294,7 +316,7 @@ const repetirGastoMes = async (req, res) => {
     `, [gasto.concepto, gasto.monto_total, fechaStr, gasto.pagado_por_id, gasto.notas, gasto.categoria_id, gasto.reparto_id || 1, id]);
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al repetir gasto' });
   }
 };
@@ -314,7 +336,7 @@ const getAdjuntos = async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar adjuntos' });
   }
 };
@@ -358,7 +380,7 @@ const uploadAdjunto = async (req, res) => {
     );
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al subir adjunto' });
   }
 };
@@ -374,7 +396,7 @@ const deleteAdjunto = async (req, res) => {
     await query('DELETE FROM reparto_adjuntos WHERE id = $1', [req.params.id]);
     res.json({ message: 'Adjunto eliminado' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al eliminar adjunto' });
   }
 };
@@ -391,14 +413,14 @@ const descargarAdjunto = async (req, res) => {
     const rutaNorm = adj.ruta.split(/[/\\]/).filter(Boolean).join(path.sep);
     const fullPath = path.join(process.cwd(), 'uploads', rutaNorm);
     if (!fs.existsSync(fullPath)) {
-      console.error('[descargarAdjunto] Archivo no encontrado:', fullPath, '(ruta en BD:', adj.ruta, ')');
+      logger.error({ fullPath, rutaBd: adj.ruta }, '[descargarAdjunto] Archivo no encontrado');
       return res.status(404).json({ error: 'Archivo no encontrado en el servidor' });
     }
     res.setHeader('Content-Type', adj.content_type || 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(adj.nombre_archivo)}"`);
     res.sendFile(fullPath);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al descargar' });
   }
 };
@@ -418,7 +440,7 @@ const getAdjuntosReembolso = async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar adjuntos' });
   }
 };
@@ -461,7 +483,7 @@ const uploadAdjuntoReembolso = async (req, res) => {
     );
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al subir adjunto' });
   }
 };
@@ -477,7 +499,7 @@ const deleteAdjuntoReembolso = async (req, res) => {
     await query('DELETE FROM reparto_reembolso_adjuntos WHERE id = $1', [req.params.id]);
     res.json({ message: 'Adjunto eliminado' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al eliminar adjunto' });
   }
 };
@@ -498,7 +520,7 @@ const descargarAdjuntoReembolso = async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(adj.nombre_archivo)}"`);
     res.sendFile(fullPath);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al descargar' });
   }
 };
@@ -509,7 +531,7 @@ const getGrupos = async (req, res) => {
     const { rows } = await query('SELECT id, nombre FROM reparto_grupos ORDER BY id');
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar grupos' });
   }
 };
@@ -526,7 +548,7 @@ const createGrupo = async (req, res) => {
     );
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al crear grupo' });
   }
 };

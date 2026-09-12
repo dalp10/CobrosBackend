@@ -43,4 +43,35 @@ const updateEstadoValidations = [
     .withMessage(`estado debe ser uno de: ${ESTADOS.join(', ')}`),
 ];
 
-module.exports = { createPrestamoValidations, updateEstadoValidations };
+const updatePrestamoValidations = [
+  body('estado').optional().isIn(ESTADOS).withMessage(`estado debe ser uno de: ${ESTADOS.join(', ')}`),
+  body('monto_original')
+    .optional()
+    .isFloat({ min: 0.01 })
+    .withMessage('monto_original debe ser un número positivo'),
+  body('fecha_inicio').optional().isISO8601().withMessage('fecha_inicio debe ser una fecha válida (ISO 8601)'),
+  body('fecha_fin').optional().isISO8601().withMessage('fecha_fin debe ser una fecha válida (ISO 8601)'),
+  body('descripcion').optional().trim().isLength({ max: 255 }),
+  body('tasa_interes').optional().isFloat({ min: 0 }),
+  body('total_cuotas').optional().isInt({ min: 1 }),
+  body('cuota_mensual').optional().isFloat({ min: 0 }),
+  body('banco').optional().trim().isLength({ max: 100 }),
+  body('numero_operacion').optional().trim().isLength({ max: 50 }),
+  body('notas').optional().trim().isLength({ max: 500 }),
+];
+
+const reprogramarValidations = [
+  body('cuota_mensual')
+    .notEmpty()
+    .withMessage('cuota_mensual requerido')
+    .isFloat({ min: 0.01 })
+    .withMessage('cuota_mensual debe ser un número positivo'),
+  body('total_cuotas')
+    .notEmpty()
+    .withMessage('total_cuotas requerido')
+    .isInt({ min: 1 })
+    .withMessage('total_cuotas debe ser un entero positivo'),
+  body('fecha_inicio').optional().isISO8601().withMessage('fecha_inicio debe ser una fecha válida (ISO 8601)'),
+];
+
+module.exports = { createPrestamoValidations, updateEstadoValidations, updatePrestamoValidations, reprogramarValidations };

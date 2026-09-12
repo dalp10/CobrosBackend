@@ -1,6 +1,92 @@
 // src/controllers/reparto.controller.js
 // Reparto de gastos (agua, luz, etc.) entre miembros de la casa. Cuota = total / N. Reembolsos = quién le devuelve a quién.
 const { query } = require('../config/db');
+const logger = require('../config/logger');
+
+/** Obtiene los participantes (miembro_id, peso) de cada gasto en gastoIds, agrupados por gasto_id. */
+async function getParticipantesByGasto(gastoIds) {
+  if (!gastoIds.length) return {};
+  const placeholders = gastoIds.map((_, i) => `$${i + 1}`).join(',');
+  const { rows } = await query(
+    `SELECT gasto_id, miembro_id, peso FROM reparto_gasto_participantes WHERE gasto_id IN (${placeholders})`,
+    gastoIds
+  );
+  const map = {};
+  for (const p of rows) {
+    if (!map[p.gasto_id]) map[p.gasto_id] = [];
+    map[p.gasto_id].push({ miembro_id: p.miembro_id, peso: Number(p.peso) });
+  }
+  return map;
+}
+
+/** Obtiene los cargos adicionales (miembro_id -> monto) de cada gasto en gastoIds, agrupados por gasto_id. */
+async function getCargosByGasto(gastoIds) {
+  if (!gastoIds.length) return {};
+  const placeholders = gastoIds.map((_, i) => `$${i + 1}`).join(',');
+  const { rows } = await query(
+    `SELECT gasto_id, miembro_id, monto FROM reparto_gasto_cargos WHERE gasto_id IN (${placeholders})`,
+    gastoIds
+  );
+  const map = {};
+  for (const c of rows) {
+    if (!map[c.gasto_id]) map[c.gasto_id] = {};
+    map[c.gasto_id][c.miembro_id] = Number(c.monto);
+  }
+  return map;
+}
+
+/**
+ * Calcula la cuota que le toca a cada miembro.
+ * Gastos con participantes definidos (que no equivalgan a repartir entre todos por igual)
+ * se reparten solo entre ellos según su peso.
+ * El resto de gastos se reparte entre todos los miembros (N), descontando primero los
+ * cargos adicionales asociados a ese gasto en particular (reparto_gasto_cargos): cada
+ * miembro con un cargo en ese gasto paga su cargo aparte sobre la base compartida.
+ */
+function calcularCuotaPorMiembro(miembros, gastosTodos, participantesByGasto, cargosByGasto) {
+  const N = miembros.length;
+  const cuotaPorMiembro = miembros.map(() => 0);
+  const idxById = {};
+  miembros.forEach((m, i) => { idxById[m.id] = i; });
+
+  const byMonth = {};
+
+  for (const g of gastosTodos) {
+    const participantes = participantesByGasto[g.id];
+    const sumPesos = participantes ? participantes.reduce((s, p) => s + p.peso, 0) : 0;
+    // Si los participantes son todos los miembros con el mismo peso, equivale a repartir
+    // entre todos por igual: se trata como gasto compartido para que apliquen los cargos
+    // adicionales de ese gasto (si no, alguien con cargo extra no vería su cuota subir
+    // ni los demás verían la suya bajar).
+    const esTodosPorIgual = !!participantes && participantes.length === N
+      && miembros.every(m => participantes.some(p => p.miembro_id === m.id))
+      && participantes.every(p => p.peso === participantes[0].peso);
+
+    const cuotasGasto = miembros.map(() => 0);
+    if (participantes && participantes.length && sumPesos > 0 && !esTodosPorIgual) {
+      for (const p of participantes) {
+        const idx = idxById[p.miembro_id];
+        if (idx === undefined) continue;
+        cuotasGasto[idx] = Number(g.monto_total) * p.peso / sumPesos;
+      }
+    } else {
+      const cargosGasto = cargosByGasto[g.id] || {};
+      const sumCargosGasto = Object.values(cargosGasto).reduce((a, b) => a + b, 0);
+      const base = N > 0 ? (Number(g.monto_total) - sumCargosGasto) / N : 0;
+      miembros.forEach((m, i) => { cuotasGasto[i] = base + (cargosGasto[m.id] || 0); });
+    }
+
+    miembros.forEach((m, i) => { cuotaPorMiembro[i] += cuotasGasto[i]; });
+
+    const d = new Date(g.fecha);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!byMonth[key]) byMonth[key] = { total: 0, cuotas: miembros.map(() => 0) };
+    byMonth[key].total += Number(g.monto_total);
+    miembros.forEach((m, i) => { byMonth[key].cuotas[i] += cuotasGasto[i]; });
+  }
+
+  return { cuotaPorMiembro, byMonth };
+}
 
 /** Calcula el saldo actual de un miembro (positivo = le deben, negativo = debe). Opcional: excluir reembolso por id para el cálculo de reembolsosDados (para validar update). */
 async function getSaldoMiembro(miembroId, excluirReembolsoId = null) {
@@ -12,8 +98,10 @@ async function getSaldoMiembro(miembroId, excluirReembolsoId = null) {
   if (N === 0) return 0;
 
   const { rows: gastosTodos } = await query(`
-    SELECT g.fecha, g.monto_total FROM reparto_gastos g WHERE (g.anulado IS NOT TRUE)
+    SELECT g.id, g.fecha, g.monto_total, g.meses FROM reparto_gastos g WHERE (g.anulado IS NOT TRUE)
   `);
+  const participantesByGasto = await getParticipantesByGasto(gastosTodos.map(g => g.id));
+  const cargosByGasto = await getCargosByGasto(gastosTodos.map(g => g.id));
   const { rows: pagadoPorMiembro } = await query(`
     SELECT g.pagado_por_id, COALESCE(SUM(g.monto_total), 0) AS total
     FROM reparto_gastos g WHERE (g.anulado IS NOT TRUE) GROUP BY g.pagado_por_id
@@ -39,21 +127,7 @@ async function getSaldoMiembro(miembroId, excluirReembolsoId = null) {
     }
   }
 
-  const cargos = miembros.map(m => Number(m.cargo_adicional_mensual || 0));
-  const sumCargos = cargos.reduce((a, b) => a + b, 0);
-  const byMonth = {};
-  for (const g of gastosTodos) {
-    const d = new Date(g.fecha);
-    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    if (!byMonth[key]) byMonth[key] = 0;
-    byMonth[key] += Number(g.monto_total);
-  }
-  const cuotaPorMiembro = miembros.map(() => 0);
-  for (const key of Object.keys(byMonth)) {
-    const totalMes = byMonth[key];
-    const base = (totalMes - sumCargos) / N;
-    miembros.forEach((m, i) => { cuotaPorMiembro[i] += base + cargos[i]; });
-  }
+  const { cuotaPorMiembro } = calcularCuotaPorMiembro(miembros, gastosTodos, participantesByGasto, cargosByGasto);
 
   const mapPagado = Object.fromEntries(pagadoPorMiembro.map(r => [r.pagado_por_id, Number(r.total)]));
   const mapRecibe = Object.fromEntries(recibeReembolso.map(r => [r.para_miembro_id, Number(r.total)]));
@@ -108,7 +182,7 @@ const getResumen = async (req, res) => {
     }
     res.json(data);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al obtener resumen de reparto' });
   }
 };
@@ -130,7 +204,7 @@ async function getResumenData(desde, hasta, repartoId = 1, miembroId = null) {
   const paramsGastos = [...paramsTotales];
   if (miembroId) paramsGastos.push(miembroId);
   const { rows: gastosList } = await query(`
-    SELECT g.id, g.concepto, g.monto_total, g.fecha, g.pagado_por_id, g.notas, g.categoria_id, g.medio_pago,
+    SELECT g.id, g.concepto, g.monto_total, g.fecha, g.pagado_por_id, g.notas, g.categoria_id, g.medio_pago, g.recurrente, g.estado, g.fecha_corte, g.fecha_vencimiento, g.meses,
            m.nombre AS pagado_por_nombre, c.nombre AS categoria_nombre, c.color AS categoria_color
     FROM reparto_gastos g
     JOIN reparto_miembros m ON m.id = g.pagado_por_id
@@ -154,13 +228,21 @@ async function getResumenData(desde, hasta, repartoId = 1, miembroId = null) {
       participantesByGasto[p.gasto_id].push({ miembro_id: p.miembro_id, peso: Math.round(Number(p.peso) * 100) / 100 });
     }
     gastosList.forEach(g => { g.participantes = participantesByGasto[g.id] || []; });
+
+    const cargosByGastoList = await getCargosByGasto(gastoIds);
+    gastosList.forEach(g => {
+      const cargosGasto = cargosByGastoList[g.id] || {};
+      g.cargos = Object.entries(cargosGasto).map(([miembro_id, monto]) => ({ miembro_id: Number(miembro_id), monto }));
+    });
   }
 
   const { rows: gastosTodos } = await query(`
-    SELECT g.fecha, g.monto_total FROM reparto_gastos g
+    SELECT g.id, g.fecha, g.monto_total, g.meses FROM reparto_gastos g
     WHERE (g.anulado IS NOT TRUE) AND COALESCE(g.reparto_id, 1) = $1
     ${conFechas ? 'AND g.fecha >= $2::date AND g.fecha <= $3::date' : ''}
   `, paramsTotales);
+  const participantesByGastoTodos = await getParticipantesByGasto(gastosTodos.map(g => g.id));
+  const cargosByGastoTodos = await getCargosByGasto(gastosTodos.map(g => g.id));
 
   const paramsReemb = [...paramsTotales];
   if (miembroId) paramsReemb.push(miembroId);
@@ -203,21 +285,7 @@ async function getResumenData(desde, hasta, repartoId = 1, miembroId = null) {
   `, paramsTotales);
 
   const totalGastos = gastosTodos.reduce((s, g) => s + Number(g.monto_total), 0);
-  const cargos = miembros.map(m => Number(m.cargo_adicional_mensual || 0));
-  const sumCargos = cargos.reduce((a, b) => a + b, 0);
-  const byMonth = {};
-  for (const g of gastosTodos) {
-    const d = new Date(g.fecha);
-    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    if (!byMonth[key]) byMonth[key] = 0;
-    byMonth[key] += Number(g.monto_total);
-  }
-  const cuotaPorMiembro = miembros.map(() => 0);
-  for (const key of Object.keys(byMonth)) {
-    const totalMes = byMonth[key];
-    const base = (totalMes - sumCargos) / N;
-    miembros.forEach((m, i) => { cuotaPorMiembro[i] += base + cargos[i]; });
-  }
+  const { cuotaPorMiembro, byMonth } = calcularCuotaPorMiembro(miembros, gastosTodos, participantesByGastoTodos, cargosByGastoTodos);
   const cuotaPorPersonaPromedio = N > 0 ? totalGastos / N : 0;
   const mapPagado = Object.fromEntries(pagadoPorMiembro.map(r => [r.pagado_por_id, Number(r.total)]));
   const mapRecibe = Object.fromEntries(recibeReembolso.map(r => [r.para_miembro_id, Number(r.total)]));
@@ -246,13 +314,12 @@ async function getResumenData(desde, hasta, repartoId = 1, miembroId = null) {
   });
 
   const resumenPorMes = Object.keys(byMonth).sort().map(key => {
-    const totalMes = byMonth[key];
-    const base = (totalMes - sumCargos) / N;
+    const { total: totalMes, cuotas } = byMonth[key];
     return {
       mes: key,
       total: Math.round(totalMes * 100) / 100,
-      cuota_por_persona: Math.round((base + sumCargos / N) * 100) / 100,
-      cuotas: miembros.map((m, i) => ({ id: m.id, nombre: m.nombre, cuota: Math.round((base + cargos[i]) * 100) / 100 })),
+      cuota_por_persona: N > 0 ? Math.round((totalMes / N) * 100) / 100 : 0,
+      cuotas: miembros.map((m, i) => ({ id: m.id, nombre: m.nombre, cuota: Math.round(cuotas[i] * 100) / 100 })),
     };
   });
 
@@ -336,7 +403,7 @@ const exportarReporte = async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send('\uFEFF' + csv);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al generar reporte' });
   }
 };
@@ -351,7 +418,7 @@ const getMiembros = async (req, res) => {
     `, [repartoId]);
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar miembros' });
   }
 };
@@ -382,7 +449,7 @@ const createMiembro = async (req, res) => {
     `, [nombreTrim, cargo, repartoId]);
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al agregar miembro' });
   }
 };
@@ -403,7 +470,7 @@ const updateMiembro = async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Miembro no encontrado' });
     res.json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al actualizar miembro' });
   }
 };
@@ -419,7 +486,7 @@ const deleteMiembro = async (req, res) => {
     if (rowCount === 0) return res.status(404).json({ error: 'Miembro no encontrado' });
     res.json({ message: 'Persona eliminada del reparto' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al eliminar miembro' });
   }
 };
@@ -434,7 +501,7 @@ const getGastos = async (req, res) => {
     if (conFechas) { params.push(desde, hasta); }
     if (miembro_id) params.push(parseInt(miembro_id, 10));
     const { rows } = await query(`
-      SELECT g.id, g.concepto, g.monto_total, g.fecha, g.pagado_por_id, g.notas, g.categoria_id, g.recurrente,
+      SELECT g.id, g.concepto, g.monto_total, g.fecha, g.pagado_por_id, g.notas, g.categoria_id, g.recurrente, g.estado, g.fecha_corte, g.fecha_vencimiento, g.meses,
              m.nombre AS pagado_por_nombre, c.nombre AS categoria_nombre, c.color AS categoria_color
       FROM reparto_gastos g
       JOIN reparto_miembros m ON m.id = g.pagado_por_id
@@ -446,7 +513,7 @@ const getGastos = async (req, res) => {
     `, params);
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar gastos' });
   }
 };
@@ -454,7 +521,7 @@ const getGastos = async (req, res) => {
 /** PUT /api/reparto/gastos/:id — actualiza concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, participantes? */
 const updateGasto = async (req, res) => {
   const { id } = req.params;
-  const { concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, participantes } = req.body;
+  const { concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, participantes, cargos } = req.body;
   const updates = [];
   const values = [];
   let i = 1;
@@ -471,6 +538,19 @@ const updateGasto = async (req, res) => {
   if (notas !== undefined) { updates.push(`notas = $${i++}`); values.push(notas === '' ? null : notas); }
   if (categoria_id !== undefined) { updates.push(`categoria_id = $${i++}`); values.push(categoria_id === '' || categoria_id == null ? null : categoria_id); }
   if (req.body.medio_pago !== undefined) { updates.push(`medio_pago = $${i++}`); values.push(req.body.medio_pago === '' || req.body.medio_pago == null ? null : req.body.medio_pago); }
+  if (req.body.fecha_corte !== undefined) { updates.push(`fecha_corte = $${i++}::date`); values.push(req.body.fecha_corte || null); }
+  if (req.body.fecha_vencimiento !== undefined) { updates.push(`fecha_vencimiento = $${i++}::date`); values.push(req.body.fecha_vencimiento || null); }
+  if (req.body.meses !== undefined) {
+    const numMeses = parseInt(req.body.meses, 10);
+    if (isNaN(numMeses) || numMeses < 1 || numMeses > 12)
+      return res.status(400).json({ error: 'meses debe ser un número entre 1 y 12' });
+    updates.push(`meses = $${i++}`); values.push(numMeses);
+  }
+  if (req.body.estado !== undefined) {
+    if (!['borrador', 'confirmado'].includes(req.body.estado))
+      return res.status(400).json({ error: "estado debe ser 'borrador' o 'confirmado'" });
+    updates.push(`estado = $${i++}`); values.push(req.body.estado);
+  }
   if (updates.length === 0 && !participantes)
     return res.status(400).json({ error: 'Indica al menos un campo a actualizar (concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, participantes)' });
   values.push(id);
@@ -497,13 +577,36 @@ const updateGasto = async (req, res) => {
         return res.status(400).json({ error: 'categoria_id no existe o no pertenece a este reparto' });
     }
     if (Array.isArray(participantes)) {
+      const idsVistos = new Set();
+      let algunPesoValido = false;
       for (const p of participantes) {
         if (p.miembro_id != null && p.peso != null && Number(p.peso) > 0) {
           if (!idsMiembros.has(Number(p.miembro_id)))
             return res.status(400).json({ error: `El miembro_id ${p.miembro_id} no pertenece al reparto` });
+          if (idsVistos.has(Number(p.miembro_id)))
+            return res.status(400).json({ error: `El miembro_id ${p.miembro_id} está duplicado en participantes` });
+          idsVistos.add(Number(p.miembro_id));
           const peso = parseFloat(p.peso);
           if (isNaN(peso) || peso > 1000)
             return res.status(400).json({ error: 'Cada peso en participantes debe ser un número entre 0.01 y 1000' });
+          algunPesoValido = true;
+        }
+      }
+      if (participantes.length > 0 && !algunPesoValido)
+        return res.status(400).json({ error: 'Si indicas participantes, al menos uno debe tener un peso mayor a 0' });
+    }
+    if (Array.isArray(cargos)) {
+      const idsVistos = new Set();
+      for (const c of cargos) {
+        if (c.miembro_id != null && c.monto != null && Number(c.monto) > 0) {
+          if (!idsMiembros.has(Number(c.miembro_id)))
+            return res.status(400).json({ error: `El miembro_id ${c.miembro_id} no pertenece al reparto` });
+          if (idsVistos.has(Number(c.miembro_id)))
+            return res.status(400).json({ error: `El miembro_id ${c.miembro_id} está duplicado en cargos` });
+          idsVistos.add(Number(c.miembro_id));
+          const monto = parseFloat(c.monto);
+          if (isNaN(monto) || monto > 100000)
+            return res.status(400).json({ error: 'Cada monto en cargos debe ser un número entre 0.01 y 100000' });
         }
       }
     }
@@ -523,6 +626,16 @@ const updateGasto = async (req, res) => {
           );
       }
     }
+    if (Array.isArray(cargos)) {
+      await query('DELETE FROM reparto_gasto_cargos WHERE gasto_id = $1', [id]);
+      for (const c of cargos) {
+        if (c.miembro_id != null && c.monto != null && Number(c.monto) > 0)
+          await query(
+            'INSERT INTO reparto_gasto_cargos (gasto_id, miembro_id, monto) VALUES ($1, $2, $3) ON CONFLICT (gasto_id, miembro_id) DO UPDATE SET monto = $3',
+            [id, c.miembro_id, parseFloat(c.monto)]
+          );
+      }
+    }
     const { rows: [row] } = await query(`
       SELECT g.*, m.nombre AS pagado_por_nombre, c.nombre AS categoria_nombre
       FROM reparto_gastos g
@@ -533,8 +646,26 @@ const updateGasto = async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Gasto no encontrado' });
     res.json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al actualizar gasto' });
+  }
+};
+
+/** PUT /api/reparto/gastos/:id/confirmar — pasa un gasto en borrador a confirmado. body: medio_pago? */
+const confirmarGasto = async (req, res) => {
+  const { id } = req.params;
+  const { medio_pago } = req.body;
+  try {
+    const { rows: [row] } = await query(`
+      UPDATE reparto_gastos SET estado = 'confirmado', medio_pago = COALESCE($2, medio_pago)
+      WHERE id = $1 AND (anulado IS NOT TRUE)
+      RETURNING *
+    `, [id, medio_pago || null]);
+    if (!row) return res.status(404).json({ error: 'Gasto no encontrado' });
+    res.json(row);
+  } catch (err) {
+    logger.error({ err });
+    res.status(500).json({ error: 'Error al confirmar gasto' });
   }
 };
 
@@ -568,13 +699,13 @@ const deleteGasto = async (req, res) => {
     if (rowCount === 0) return res.status(404).json({ error: 'Gasto no encontrado' });
     res.json({ message: 'Gasto anulado' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al anular gasto' });
   }
 };
 /** POST /api/reparto/gastos — body: concepto, monto_total, fecha?, pagado_por_id, notas?, categoria_id?, reparto_id?, medio_pago?, participantes? */
 const createGasto = async (req, res) => {
-  const { concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, reparto_id, participantes } = req.body;
+  const { concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, reparto_id, participantes, estado, fecha_corte, fecha_vencimiento, meses, cargos } = req.body;
   if (!concepto || monto_total == null || !pagado_por_id)
     return res.status(400).json({ error: 'Faltan concepto, monto_total o pagado_por_id' });
   if (typeof concepto === 'string' && concepto.trim().length > 500)
@@ -582,6 +713,11 @@ const createGasto = async (req, res) => {
   const monto = parseFloat(monto_total);
   if (isNaN(monto) || monto <= 0)
     return res.status(400).json({ error: 'monto_total debe ser mayor a 0' });
+  if (estado != null && !['borrador', 'confirmado'].includes(estado))
+    return res.status(400).json({ error: "estado debe ser 'borrador' o 'confirmado'" });
+  const numMeses = meses != null ? parseInt(meses, 10) : 1;
+  if (isNaN(numMeses) || numMeses < 1 || numMeses > 12)
+    return res.status(400).json({ error: 'meses debe ser un número entre 1 y 12' });
   const repartoId = reparto_id != null ? parseInt(reparto_id, 10) : 1;
   try {
     const { rows: miembrosReparto } = await query(
@@ -600,21 +736,44 @@ const createGasto = async (req, res) => {
         return res.status(400).json({ error: 'categoria_id no existe o no pertenece a este reparto' });
     }
     if (Array.isArray(participantes)) {
+      const idsVistos = new Set();
+      let algunPesoValido = false;
       for (const p of participantes) {
         if (p.miembro_id != null && p.peso != null && Number(p.peso) > 0) {
           if (!idsMiembros.has(Number(p.miembro_id)))
             return res.status(400).json({ error: `El miembro_id ${p.miembro_id} no pertenece al reparto` });
+          if (idsVistos.has(Number(p.miembro_id)))
+            return res.status(400).json({ error: `El miembro_id ${p.miembro_id} está duplicado en participantes` });
+          idsVistos.add(Number(p.miembro_id));
           const peso = parseFloat(p.peso);
           if (isNaN(peso) || peso > 1000)
             return res.status(400).json({ error: 'Cada peso en participantes debe ser un número entre 0.01 y 1000' });
+          algunPesoValido = true;
+        }
+      }
+      if (participantes.length > 0 && !algunPesoValido)
+        return res.status(400).json({ error: 'Si indicas participantes, al menos uno debe tener un peso mayor a 0' });
+    }
+    if (Array.isArray(cargos)) {
+      const idsVistos = new Set();
+      for (const c of cargos) {
+        if (c.miembro_id != null && c.monto != null && Number(c.monto) > 0) {
+          if (!idsMiembros.has(Number(c.miembro_id)))
+            return res.status(400).json({ error: `El miembro_id ${c.miembro_id} no pertenece al reparto` });
+          if (idsVistos.has(Number(c.miembro_id)))
+            return res.status(400).json({ error: `El miembro_id ${c.miembro_id} está duplicado en cargos` });
+          idsVistos.add(Number(c.miembro_id));
+          const monto2 = parseFloat(c.monto);
+          if (isNaN(monto2) || monto2 > 100000)
+            return res.status(400).json({ error: 'Cada monto en cargos debe ser un número entre 0.01 y 100000' });
         }
       }
     }
     const { rows: [row] } = await query(`
-      INSERT INTO reparto_gastos (concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, reparto_id, medio_pago)
-      VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8)
+      INSERT INTO reparto_gastos (concepto, monto_total, fecha, pagado_por_id, notas, categoria_id, reparto_id, medio_pago, estado, fecha_corte, fecha_vencimiento, meses)
+      VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9, $10::date, $11::date, $12)
       RETURNING *
-    `, [concepto.trim(), monto, fecha || new Date().toISOString().split('T')[0], pagado_por_id, notas || null, categoria_id || null, repartoId, req.body.medio_pago || null]);
+    `, [concepto.trim(), monto, fecha || new Date().toISOString().split('T')[0], pagado_por_id, notas || null, categoria_id || null, repartoId, req.body.medio_pago || null, estado === 'borrador' ? 'borrador' : 'confirmado', fecha_corte || null, fecha_vencimiento || null, numMeses]);
     if (Array.isArray(participantes) && row) {
       for (const p of participantes) {
         if (p.miembro_id != null && p.peso != null && Number(p.peso) > 0)
@@ -624,9 +783,18 @@ const createGasto = async (req, res) => {
           );
       }
     }
+    if (Array.isArray(cargos) && row) {
+      for (const c of cargos) {
+        if (c.miembro_id != null && c.monto != null && Number(c.monto) > 0)
+          await query(
+            'INSERT INTO reparto_gasto_cargos (gasto_id, miembro_id, monto) VALUES ($1, $2, $3)',
+            [row.id, c.miembro_id, parseFloat(c.monto)]
+          );
+      }
+    }
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al registrar gasto' });
   }
 };
@@ -653,7 +821,7 @@ const getReembolsos = async (req, res) => {
     `, params);
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al listar reembolsos' });
   }
 };
@@ -704,7 +872,7 @@ const createReembolso = async (req, res) => {
     `, [de_miembro_id, para_miembro_id, num, fecha || new Date().toISOString().split('T')[0], concepto || null, notas || null, gasto_id || null, repartoId, req.body.medio_pago || null]);
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al registrar reembolso' });
   }
 };
@@ -779,7 +947,7 @@ const updateReembolso = async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Reembolso no encontrado' });
     res.json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al actualizar reembolso' });
   }
 };
@@ -795,7 +963,7 @@ const deleteReembolso = async (req, res) => {
     if (rowCount === 0) return res.status(404).json({ error: 'Reembolso no encontrado' });
     res.json({ message: 'Reembolso anulado' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al anular reembolso' });
   }
 };
@@ -810,6 +978,7 @@ module.exports = {
   getGastos,
   createGasto,
   updateGasto,
+  confirmarGasto,
   deleteGasto,
   getReembolsos,
   createReembolso,

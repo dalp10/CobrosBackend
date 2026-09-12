@@ -1,5 +1,6 @@
 // src/utils/uploads.js
 const path = require('path');
+const logger = require('../config/logger');
 const fs = require('fs');
 
 const uploadsDir = path.resolve(process.env.UPLOADS_DIR || './uploads');
@@ -24,7 +25,7 @@ function tryDeleteUpload(relativeUrl) {
   try {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   } catch (e) {
-    console.warn('No se pudo eliminar archivo de uploads:', e.message);
+    logger.warn({ err: e }, 'No se pudo eliminar archivo de uploads');
   }
 }
 

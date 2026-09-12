@@ -67,3 +67,27 @@ npm run db:seed
 3. Health check: `GET /api/health` (debe devolver 200 y `db: "connected"`).
 
 El módulo exporta la app Express (`module.exports = app`) para poder probarla con supertest sin levantar el servidor.
+
+## Backup de la base de datos (PostgreSQL)
+
+### Backup manual
+
+```bash
+# Exportar (desde tu máquina, usando las credenciales de Railway)
+pg_dump "postgresql://USER:PASSWORD@HOST:PORT/DBNAME" -F c -f backup_$(date +%Y%m%d).dump
+
+# Restaurar
+pg_restore -d "postgresql://USER:PASSWORD@HOST:PORT/DBNAME" --clean backup_20260101.dump
+```
+
+Las credenciales de conexión están en el panel del servicio PostgreSQL de Railway (pestaña "Connect" → `DATABASE_URL` / `DATABASE_PUBLIC_URL`).
+
+### Backups automáticos en Railway
+
+Railway no incluye backups automáticos en el plan gratuito. Opciones:
+
+1. **Railway Pro**: habilita backups diarios automáticos desde el panel del servicio de PostgreSQL.
+2. **GitHub Actions programado**: un workflow con `schedule` (cron) que ejecute `pg_dump` contra `DATABASE_PUBLIC_URL` y suba el archivo a un bucket (S3, R2, etc.) o lo adjunte como artifact. Requiere guardar `DATABASE_PUBLIC_URL` como secret del repo.
+3. **Script local programado** (cron/Tareas programadas de Windows) que ejecute el comando `pg_dump` de arriba periódicamente contra `DATABASE_PUBLIC_URL`.
+
+Recomendación: empezar con backups manuales antes de cambios grandes (migraciones, limpiezas de datos) y automatizar con la opción 2 cuando el volumen de datos lo justifique.

@@ -1,5 +1,6 @@
 // src/controllers/deudores.controller.js
 const { query } = require('../config/db');
+const logger = require('../config/logger');
 
 // GET /deudores — lista con resumen financiero (una fila por persona; agrupa duplicados por nombre+apellidos)
 const DEUDORES_LIMIT_MAX = 200;
@@ -12,6 +13,14 @@ const getAll = async (req, res) => {
 
   try {
     const { rows } = await query(`
+      WITH pagos_por_deudor AS (
+        SELECT deudor_id, SUM(monto) AS total_pagado, MAX(fecha_pago) AS ultimo_pago
+        FROM pagos GROUP BY deudor_id
+      ),
+      prestamos_por_deudor AS (
+        SELECT deudor_id, SUM(monto_original) AS total_prestado, COUNT(*) AS num_prestamos
+        FROM prestamos GROUP BY deudor_id
+      )
       SELECT
         MIN(d.id) AS id,
         d.nombre,
@@ -24,15 +33,14 @@ const getAll = async (req, res) => {
         BOOL_OR(d.activo) AS activo,
         MIN(d.created_at) AS created_at,
         MIN(d.updated_at) AS updated_at,
-        COALESCE(SUM(p.monto), 0)                          AS total_pagado,
-        COALESCE(SUM(pr.monto_original), 0)                AS total_prestado,
-        COALESCE(SUM(pr.monto_original), 0)
-          - COALESCE(SUM(p.monto), 0)                      AS saldo_pendiente,
-        COUNT(DISTINCT pr.id)                              AS total_prestamos,
-        MAX(p.fecha_pago)                                  AS ultimo_pago
+        COALESCE(SUM(ppd.total_pagado), 0) AS total_pagado,
+        COALESCE(SUM(prd.total_prestado), 0) AS total_prestado,
+        COALESCE(SUM(prd.total_prestado), 0) - COALESCE(SUM(ppd.total_pagado), 0) AS saldo_pendiente,
+        COALESCE(SUM(prd.num_prestamos), 0)::int AS total_prestamos,
+        MAX(ppd.ultimo_pago) AS ultimo_pago
       FROM deudores d
-      LEFT JOIN prestamos pr ON pr.deudor_id = d.id
-      LEFT JOIN pagos p      ON p.deudor_id  = d.id
+      LEFT JOIN pagos_por_deudor ppd ON ppd.deudor_id = d.id
+      LEFT JOIN prestamos_por_deudor prd ON prd.deudor_id = d.id
       WHERE d.activo = true
       GROUP BY d.nombre, d.apellidos
       ORDER BY d.apellidos, d.nombre
@@ -47,7 +55,7 @@ const getAll = async (req, res) => {
 
     res.json({ data: rows, total: parseInt(total), page, limit });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al obtener deudores' });
   }
 };
@@ -62,10 +70,30 @@ const getById = async (req, res) => {
     );
     if (!deudor) return res.status(404).json({ error: 'Deudor no encontrado' });
 
-    // Sus préstamos
-    const { rows: prestamos } = await query(
-      'SELECT * FROM prestamos WHERE deudor_id = $1 ORDER BY fecha_inicio DESC', [id]
-    );
+    // Sus préstamos (con totales pagados, saldo pendiente y desglose capital/interés)
+    const { rows: prestamos } = await query(`
+      SELECT
+        pr.*,
+        COALESCE(SUM(p.monto), 0) AS total_pagado,
+        COALESCE(
+          (SELECT SUM(c.monto_esperado) FROM cuotas c WHERE c.prestamo_id = pr.id),
+          pr.monto_original
+        ) - COALESCE(SUM(p.monto), 0) AS saldo_pendiente,
+        pr.monto_original - (
+          SELECT COALESCE(SUM(c.monto_capital * c.monto_pagado / NULLIF(c.monto_esperado, 0)), 0)
+          FROM cuotas c WHERE c.prestamo_id = pr.id
+        ) AS saldo_capital,
+        (SELECT COALESCE(SUM(c.monto_interes), 0) FROM cuotas c WHERE c.prestamo_id = pr.id) AS interes_total,
+        (
+          SELECT COALESCE(SUM(c.monto_interes * c.monto_pagado / NULLIF(c.monto_esperado, 0)), 0)
+          FROM cuotas c WHERE c.prestamo_id = pr.id
+        ) AS interes_pagado
+      FROM prestamos pr
+      LEFT JOIN pagos p ON p.prestamo_id = pr.id
+      WHERE pr.deudor_id = $1
+      GROUP BY pr.id
+      ORDER BY pr.fecha_inicio DESC
+    `, [id]);
 
     // Sus pagos
     const { rows: pagos } = await query(`
@@ -84,26 +112,30 @@ const getById = async (req, res) => {
       FROM pagos WHERE deudor_id = $1
     `, [id]);
 
-    res.json({ ...deudor, prestamos, pagos, resumen });
+    const total_prestado = prestamos.reduce((s, p) => s + +(p.monto_original ?? 0), 0);
+    const total_pagado = +resumen.total_pagado;
+    const saldo_pendiente = prestamos.reduce((s, p) => s + +(p.saldo_pendiente ?? 0), 0);
+
+    res.json({ ...deudor, total_prestado, total_pagado, saldo_pendiente, prestamos, pagos, resumen });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al obtener deudor' });
   }
 };
 
 // POST /deudores
 const create = async (req, res) => {
-  const { nombre, apellidos, dni, telefono, email, direccion, notas } = req.body;
+  const { nombre, apellidos, dni, telefono, email, direccion, notas, fecha_compromiso_pago, monto_compromiso_pago, notas_compromiso } = req.body;
   if (!nombre || !apellidos)
     return res.status(400).json({ error: 'Nombre y apellidos son requeridos' });
   try {
     const { rows: [row] } = await query(`
-      INSERT INTO deudores (nombre, apellidos, dni, telefono, email, direccion, notas)
-      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-    `, [nombre, apellidos, dni||null, telefono||null, email||null, direccion||null, notas||null]);
+      INSERT INTO deudores (nombre, apellidos, dni, telefono, email, direccion, notas, fecha_compromiso_pago, monto_compromiso_pago, notas_compromiso)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *
+    `, [nombre, apellidos, dni||null, telefono||null, email||null, direccion||null, notas||null, fecha_compromiso_pago||null, monto_compromiso_pago||null, notas_compromiso||null]);
     res.status(201).json(row);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al crear deudor' });
   }
 };
@@ -111,18 +143,39 @@ const create = async (req, res) => {
 // PUT /deudores/:id
 const update = async (req, res) => {
   const { id } = req.params;
-  const { nombre, apellidos, dni, telefono, email, direccion, notas, activo } = req.body;
+  const body = req.body;
+  const updates = [];
+  const values = [];
+  const optionalNullables = ['dni', 'telefono', 'email', 'direccion', 'notas', 'fecha_compromiso_pago', 'monto_compromiso_pago', 'notas_compromiso'];
+  let i = 1;
+  const set = (key, val) => {
+    updates.push(`${key}=$${i}`);
+    values.push(val);
+    i++;
+  };
+  if (body.nombre !== undefined) set('nombre', body.nombre);
+  if (body.apellidos !== undefined) set('apellidos', body.apellidos);
+  for (const key of optionalNullables) {
+    if (!body.hasOwnProperty(key)) continue;
+    const val = body[key];
+    if (key === 'monto_compromiso_pago' && val != null && val !== '') {
+      set(key, parseFloat(val));
+    } else {
+      set(key, val === '' || val === null ? null : val);
+    }
+  }
+  if (body.activo !== undefined) set('activo', body.activo);
+  if (updates.length === 0) return res.status(400).json({ error: 'No hay campos para actualizar' });
+  values.push(id);
   try {
-    const { rows: [row] } = await query(`
-      UPDATE deudores SET
-        nombre=$1, apellidos=$2, dni=$3, telefono=$4,
-        email=$5, direccion=$6, notas=$7, activo=$8
-      WHERE id=$9 RETURNING *
-    `, [nombre, apellidos, dni, telefono, email, direccion, notas,
-        activo !== undefined ? activo : true, id]);
+    const { rows: [row] } = await query(
+      `UPDATE deudores SET ${updates.join(', ')}, updated_at = NOW() WHERE id=$${i} RETURNING *`,
+      values
+    );
     if (!row) return res.status(404).json({ error: 'No encontrado' });
     res.json(row);
   } catch (err) {
+    logger.error({ err });
     res.status(500).json({ error: 'Error al actualizar' });
   }
 };

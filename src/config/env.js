@@ -9,7 +9,7 @@ function requireEnv(keys) {
 }
 
 function ensureEnv() {
-  requireEnv(['JWT_SECRET']);
+  requireEnv(['JWT_SECRET', 'JWT_REFRESH_SECRET']);
   if (process.env.NODE_ENV === 'production') {
     requireEnv(['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']);
   }

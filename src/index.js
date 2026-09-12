@@ -1,13 +1,19 @@
 // src/index.js
 const express  = require('express');
 const cors     = require('cors');
+const cookieParser = require('cookie-parser');
 const path     = require('path');
 const helmet   = require('helmet');
 require('dotenv').config();
 
+const pinoHttp = require('pino-http');
+const swaggerUi = require('swagger-ui-express');
+const swaggerSpec = require('./config/swagger');
+
 const { ensureEnv } = require('./config/env');
 const { checkDb } = require('./config/health');
 const { pgErrorToHttp } = require('./utils/pgErrors');
+const logger = require('./config/logger');
 
 ensureEnv();
 
@@ -23,10 +29,14 @@ const allowedOrigins = rawOrigins
   : (isProduction ? [] : ['http://localhost:4200']);
 
 if (isProduction && allowedOrigins.length === 0) {
-  console.warn('⚠️  ALLOWED_ORIGINS no está definido. Define en Railway la URL de tu frontend (ej. https://tu-app.vercel.app).');
+  logger.warn('ALLOWED_ORIGINS no está definido. Define en Railway la URL de tu frontend (ej. https://tu-app.vercel.app).');
 }
 
 // ── Middlewares globales ───────────────────────────────────────
+app.use(pinoHttp({
+  logger,
+  autoLogging: { ignore: (req) => req.url === '/api/health' },
+}));
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({
   origin: (origin, cb) => {
@@ -37,6 +47,7 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
 // Rate limit general para /api (excluir health para que el orchestrator no falle)
 const { apiLimiter } = require('./middleware/rateLimit');
@@ -55,6 +66,9 @@ app.use('/api', (req, res, next) => {
 const uploadsDir = process.env.UPLOADS_DIR || './uploads';
 app.use('/uploads', express.static(path.resolve(uploadsDir)));
 
+// ── Documentación API (Swagger) ─────────────────────────────────
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 // ── Rutas ──────────────────────────────────────────────────────
 app.use('/api/auth',      require('./routes/auth.routes'));
 app.use('/api/deudores',  require('./routes/deudores.routes'));
@@ -63,14 +77,28 @@ app.use('/api/usuarios',  require('./routes/usuarios.routes'));
 app.use('/api/pagos',     require('./routes/pagos.routes'));
 app.use('/api/alertas',   require('./routes/alertas.routes'));
 app.use('/api/reparto',   require('./routes/reparto.routes'));
+app.use('/api/analitica', require('./routes/analitica.routes'));
 
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     tags: [Health]
+ *     summary: Estado del servidor y conexión a la base de datos
+ *     security: []
+ *     responses:
+ *       200:
+ *         description: Servidor operativo
+ *       503:
+ *         description: Base de datos no disponible
+ */
 // ── Health check ───────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   try {
     await checkDb();
     res.json({ status: 'ok', timestamp: new Date().toISOString(), db: 'connected' });
   } catch (err) {
-    console.error('Health check DB:', err.message);
+    logger.error({ err }, 'Health check DB');
     res.status(503).json({
       status: 'degraded',
       timestamp: new Date().toISOString(),
@@ -89,7 +117,7 @@ app.use((req, res) => {
 
 // ── Error handler global ───────────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error('Error no manejado:', err);
+  (req.log || logger).error({ err }, 'Error no manejado');
   if (err.code === 'LIMIT_FILE_SIZE')
     return res.status(413).json({ error: 'Archivo demasiado grande' });
   const pg = pgErrorToHttp(err);
@@ -103,8 +131,8 @@ const PORT = process.env.PORT || 3000;
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
-    console.log(`📂 Uploads en: ${path.resolve(uploadsDir)}`);
+    logger.info(`🚀 Servidor corriendo en http://localhost:${PORT}`);
+    logger.info(`📂 Uploads en: ${path.resolve(uploadsDir)}`);
   });
 }
 

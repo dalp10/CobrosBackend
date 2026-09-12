@@ -1,4 +1,5 @@
 const bcrypt = require('bcryptjs');
+const logger = require('../config/logger');
 const { query } = require('../config/db');
 
 // GET /usuarios - solo admin
@@ -25,7 +26,7 @@ const getAll = async (req, res) => {
     }
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al obtener usuarios' });
   }
 };
@@ -48,7 +49,7 @@ const create = async (req, res) => {
     );
     res.status(201).json(user);
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al crear usuario' });
   }
 };

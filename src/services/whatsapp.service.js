@@ -1,4 +1,5 @@
 // src/services/whatsapp.service.js
+const logger = require('../config/logger');
 // Envío de mensajes por WhatsApp vía Twilio.
 // Variables de entorno: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM (ej. whatsapp:+14155238886 para sandbox).
 
@@ -34,7 +35,7 @@ function toE164(telefono, defaultCountryCode = '51') {
 async function sendWhatsApp(to, body) {
   const client = getClient();
   if (!client) {
-    return { ok: false, error: 'WhatsApp no configurado. Definir TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN y TWILIO_WHATSAPP_FROM.' };
+    return { ok: false, error: 'WhatsApp no configurado. Definir TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN y TWILIO_WHATSAPP_FROM.', code: 'NOT_CONFIGURED' };
   }
   const from = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
   const toE164Num = toE164(to);
@@ -50,7 +51,7 @@ async function sendWhatsApp(to, body) {
     });
     return { ok: true, sid: message.sid };
   } catch (err) {
-    console.error('Twilio WhatsApp error:', err.message);
+    logger.error({ err }, 'Twilio WhatsApp error');
     const code = err.code || err.status;
     const msg = err.message || 'Error al enviar el mensaje';
     return { ok: false, error: msg, code };

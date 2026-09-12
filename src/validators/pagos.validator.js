@@ -36,6 +36,7 @@ const updatePagoValidations = [
   body('fecha_pago').optional().isISO8601().withMessage('fecha_pago debe ser una fecha válida'),
   body('monto').optional().isFloat({ min: 0.01 }).withMessage('monto debe ser positivo'),
   body('metodo_pago').optional().isIn(METODOS_PAGO).withMessage(`metodo_pago debe ser uno de: ${METODOS_PAGO.join(', ')}`),
+  body('prestamo_id').optional().isInt({ min: 1 }),
   body('numero_operacion').optional().trim().isLength({ max: 50 }),
   body('banco_origen').optional().trim().isLength({ max: 100 }),
   body('concepto').optional().trim().isLength({ max: 255 }),

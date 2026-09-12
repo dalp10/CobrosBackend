@@ -24,6 +24,7 @@ router.delete('/miembros/:id', validateParamId, ctrl.deleteMiembro);
 router.get('/gastos', ctrl.getGastos);
 router.post('/gastos', ctrl.createGasto);
 router.put('/gastos/:id', validateParamId, ctrl.updateGasto);
+router.put('/gastos/:id/confirmar', validateParamId, ctrl.confirmarGasto);
 router.delete('/gastos/:id', validateParamId, ctrl.deleteGasto);
 router.get('/reembolsos', ctrl.getReembolsos);
 router.post('/reembolsos', ctrl.createReembolso);

@@ -82,6 +82,9 @@ async function migrate() {
         direccion       TEXT,
         notas           TEXT,
         activo          BOOLEAN DEFAULT true,
+        fecha_compromiso_pago DATE,
+        monto_compromiso_pago NUMERIC(12,2),
+        notas_compromiso TEXT,
         created_at      TIMESTAMPTZ DEFAULT NOW(),
         updated_at      TIMESTAMPTZ DEFAULT NOW()
       );

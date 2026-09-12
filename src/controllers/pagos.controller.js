@@ -1,6 +1,56 @@
 // src/controllers/pagos.controller.js
 const { query, getClient } = require('../config/db');
+const logger = require('../config/logger');
 const { tryDeleteUpload } = require('../utils/uploads');
+
+// Reparte `monto` sobre el cronograma de cuotas pendientes de un préstamo:
+// cubre primero el saldo de la cuota más antigua pendiente/parcial/vencida
+// y, si sobra, abona a las siguientes en orden. Devuelve el detalle de
+// cuotas afectadas (con el desglose capital/interés de cada abono).
+const aplicarPagoACuotas = async (client, prestamoId, monto) => {
+  const { rows: cuotasPendientes } = await client.query(
+    `SELECT * FROM cuotas WHERE prestamo_id = $1 AND estado != 'pagado' ORDER BY numero_cuota`,
+    [prestamoId]
+  );
+
+  const cuotasAplicadas = [];
+  let restante = parseFloat(monto);
+  for (const cuota of cuotasPendientes) {
+    if (restante <= 0) break;
+
+    const faltante = parseFloat(cuota.monto_esperado) - parseFloat(cuota.monto_pagado);
+    const aplicado = Math.min(restante, faltante);
+    const nuevoPagado = parseFloat(cuota.monto_pagado) + aplicado;
+    const nuevoEstado = nuevoPagado >= parseFloat(cuota.monto_esperado) ? 'pagado' : 'parcial';
+
+    await client.query(
+      'UPDATE cuotas SET monto_pagado = $1, estado = $2 WHERE id = $3',
+      [nuevoPagado, nuevoEstado, cuota.id]
+    );
+
+    // Reparte el monto aplicado a esta cuota entre capital e interés
+    // compensatorio, en la misma proporción que tiene la cuota.
+    const montoEsperadoCuota = parseFloat(cuota.monto_esperado);
+    const proporcionInteres = montoEsperadoCuota > 0 ? parseFloat(cuota.monto_interes || 0) / montoEsperadoCuota : 0;
+    const interesAplicado = Math.round(aplicado * proporcionInteres * 100) / 100;
+    const capitalAplicado = Math.round((aplicado - interesAplicado) * 100) / 100;
+
+    cuotasAplicadas.push({
+      numero_cuota: cuota.numero_cuota,
+      monto_aplicado: aplicado,
+      monto_pagado: nuevoPagado,
+      monto_esperado: montoEsperadoCuota,
+      estado: nuevoEstado,
+      saldo_restante: parseFloat(cuota.monto_esperado) - nuevoPagado,
+      capital_aplicado: capitalAplicado,
+      interes_aplicado: interesAplicado
+    });
+
+    restante -= aplicado;
+  }
+
+  return cuotasAplicadas;
+};
 
 // GET /pagos?deudor_id=&prestamo_id=&metodo=&desde=&hasta=
 const getAll = async (req, res) => {
@@ -39,7 +89,7 @@ const getAll = async (req, res) => {
 
     res.json({ data: rows, total: parseInt(count), page: parseInt(page), limit: parseInt(limit) });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al obtener pagos' });
   }
 };
@@ -49,7 +99,7 @@ const create = async (req, res) => {
   const {
     deudor_id, prestamo_id, cuota_id,
     fecha_pago, monto, metodo_pago,
-    numero_operacion, banco_origen, concepto, notas
+    numero_operacion, banco_origen, concepto, notas, force
   } = req.body;
 
   if (!deudor_id || !fecha_pago || !monto || !metodo_pago)
@@ -62,12 +112,59 @@ const create = async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // Detectar posible pago duplicado: mismo deudor + mismo nro. de operación,
+    // o mismo deudor + misma fecha + mismo monto + mismo método.
+    if (force !== 'true' && force !== true) {
+      const dupQuery = numero_operacion
+        ? `SELECT id, fecha_pago, monto, metodo_pago, numero_operacion FROM pagos
+           WHERE deudor_id = $1 AND numero_operacion = $2`
+        : `SELECT id, fecha_pago, monto, metodo_pago, numero_operacion FROM pagos
+           WHERE deudor_id = $1 AND fecha_pago = $2 AND monto = $3 AND metodo_pago = $4`;
+      const dupParams = numero_operacion
+        ? [deudor_id, numero_operacion]
+        : [deudor_id, fecha_pago, parseFloat(monto), metodo_pago];
+
+      const { rows: duplicados } = await client.query(dupQuery, dupParams);
+      if (duplicados.length > 0) {
+        await client.query('ROLLBACK');
+        if (imagen_url) tryDeleteUpload(imagen_url);
+        return res.status(409).json({
+          error: 'Ya existe un pago similar registrado para este deudor',
+          duplicado: true,
+          pago_existente: duplicados[0]
+        });
+      }
+    }
+
+    // El pago no puede exceder el saldo pendiente del préstamo.
+    if (prestamo_id) {
+      const { rows: [{ monto_original, total_pagado }] } = await client.query(`
+        SELECT pr.monto_original, COALESCE(SUM(p.monto), 0) AS total_pagado
+        FROM prestamos pr
+        LEFT JOIN pagos p ON p.prestamo_id = pr.id
+        WHERE pr.id = $1
+        GROUP BY pr.monto_original
+      `, [prestamo_id]);
+
+      const saldoPendiente = parseFloat(monto_original) - parseFloat(total_pagado);
+      if (parseFloat(monto) > saldoPendiente + 0.01) {
+        await client.query('ROLLBACK');
+        if (imagen_url) tryDeleteUpload(imagen_url);
+        return res.status(400).json({
+          error: `El monto excede el saldo pendiente del préstamo (S/ ${saldoPendiente.toFixed(2)})`
+        });
+      }
+    }
+
+    // Si el pago está asociado a un préstamo, repartir el monto sobre el cronograma de cuotas.
+    const cuotasAplicadas = prestamo_id ? await aplicarPagoACuotas(client, prestamo_id, monto) : [];
+
     const { rows: [pago] } = await client.query(`
       INSERT INTO pagos
         (deudor_id, prestamo_id, cuota_id, fecha_pago, monto, metodo_pago,
          numero_operacion, banco_origen, concepto, notas,
-         imagen_url, imagen_nombre, registrado_por)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         imagen_url, imagen_nombre, registrado_por, cuotas_aplicadas)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING *
     `, [
       deudor_id, prestamo_id||null, cuota_id||null,
@@ -75,30 +172,15 @@ const create = async (req, res) => {
       numero_operacion||null, banco_origen||null,
       concepto||null, notas||null,
       imagen_url, imagen_nombre,
-      req.user?.id || null
+      req.user?.id || null,
+      cuotasAplicadas.length ? JSON.stringify(cuotasAplicadas) : null
     ]);
-
-    // Si se especificó cuota, actualizar su estado
-    if (cuota_id) {
-      const { rows: [cuota] } = await client.query(
-        'SELECT * FROM cuotas WHERE id = $1', [cuota_id]
-      );
-      if (cuota) {
-        const nuevoPagado = parseFloat(cuota.monto_pagado) + parseFloat(monto);
-        const nuevoEstado = nuevoPagado >= parseFloat(cuota.monto_esperado)
-          ? 'pagado' : 'parcial';
-        await client.query(
-          'UPDATE cuotas SET monto_pagado = $1, estado = $2 WHERE id = $3',
-          [nuevoPagado, nuevoEstado, cuota_id]
-        );
-      }
-    }
 
     await client.query('COMMIT');
     res.status(201).json(pago);
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al registrar pago' });
   } finally {
     client.release();
@@ -108,12 +190,18 @@ const create = async (req, res) => {
 // PUT /pagos/:id — actualizar pago (con imagen opcional vía multer)
 const update = async (req, res) => {
   const { id } = req.params;
-  const { fecha_pago, monto, metodo_pago, numero_operacion, banco_origen, concepto, notas, remove_imagen } = req.body;
+  const { fecha_pago, monto, metodo_pago, numero_operacion, banco_origen, concepto, notas, remove_imagen, prestamo_id } = req.body;
 
+  const client = await getClient();
   try {
+    await client.query('BEGIN');
+
     // Obtener pago actual para manejar imagen vieja
-    const { rows: [pagoActual] } = await query('SELECT * FROM pagos WHERE id = $1', [id]);
-    if (!pagoActual) return res.status(404).json({ error: 'Pago no encontrado' });
+    const { rows: [pagoActual] } = await client.query('SELECT * FROM pagos WHERE id = $1', [id]);
+    if (!pagoActual) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Pago no encontrado' });
+    }
 
     let imagen_url    = pagoActual.imagen_url;
     let imagen_nombre = pagoActual.imagen_nombre;
@@ -128,30 +216,70 @@ const update = async (req, res) => {
       imagen_nombre = null;
     }
 
-    const { rows: [row] } = await query(`
+    // Asociar el pago a un préstamo (solo si todavía no tenía uno): reparte
+    // el monto sobre el cronograma de cuotas, igual que al crear el pago.
+    let nuevoPrestamoId = pagoActual.prestamo_id;
+    let cuotasAplicadas = pagoActual.cuotas_aplicadas;
+    if (prestamo_id && !pagoActual.prestamo_id) {
+      const montoFinal = monto != null ? parseFloat(monto) : parseFloat(pagoActual.monto);
+
+      const { rows: [{ monto_original, total_pagado }] } = await client.query(`
+        SELECT pr.monto_original, COALESCE(SUM(p.monto), 0) AS total_pagado
+        FROM prestamos pr
+        LEFT JOIN pagos p ON p.prestamo_id = pr.id
+        WHERE pr.id = $1
+        GROUP BY pr.monto_original
+      `, [prestamo_id]);
+
+      const saldoPendiente = parseFloat(monto_original) - parseFloat(total_pagado);
+      if (montoFinal > saldoPendiente + 0.01) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: `El monto excede el saldo pendiente del préstamo (S/ ${saldoPendiente.toFixed(2)})`
+        });
+      }
+
+      const aplicadas = await aplicarPagoACuotas(client, prestamo_id, montoFinal);
+      nuevoPrestamoId = prestamo_id;
+      cuotasAplicadas = aplicadas.length ? JSON.stringify(aplicadas) : null;
+    } else if (prestamo_id && pagoActual.prestamo_id && parseInt(prestamo_id, 10) !== pagoActual.prestamo_id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Este pago ya está asociado a un préstamo y no se puede cambiar.' });
+    }
+
+    const { rows: [row] } = await client.query(`
       UPDATE pagos SET
         fecha_pago=$1, monto=$2, metodo_pago=$3,
         numero_operacion=$4, banco_origen=$5,
         concepto=$6, notas=$7,
-        imagen_url=$8, imagen_nombre=$9
-      WHERE id=$10 RETURNING *
+        imagen_url=$8, imagen_nombre=$9,
+        prestamo_id=$10, cuotas_aplicadas=$11
+      WHERE id=$12 RETURNING *
     `, [
       fecha_pago, parseFloat(monto), metodo_pago,
       numero_operacion || null, banco_origen || null,
       concepto || null, notas || null,
       imagen_url, imagen_nombre,
+      nuevoPrestamoId || null, cuotasAplicadas,
       id
     ]);
 
-    if (!row) return res.status(404).json({ error: 'Pago no encontrado' });
+    if (!row) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Pago no encontrado' });
+    }
+    await client.query('COMMIT');
     res.json(row);
   } catch (err) {
-    console.error('Error en PUT /pagos/:id →', err);
+    await client.query('ROLLBACK');
+    logger.error({ err }, 'Error en PUT /pagos/:id');
     const isProd = process.env.NODE_ENV === 'production';
     res.status(500).json({
       error: 'Error al actualizar pago',
       ...(isProd ? {} : { detalle: err.message }),
     });
+  } finally {
+    client.release();
   }
 };
 
@@ -165,7 +293,7 @@ const remove = async (req, res) => {
     await query('DELETE FROM pagos WHERE id = $1', [id]);
     res.json({ message: 'Pago eliminado' });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al eliminar pago' });
   }
 };
@@ -173,18 +301,18 @@ const remove = async (req, res) => {
 // GET /pagos/resumen — dashboard stats
 const resumen = async (req, res) => {
   try {
+    // Por deudor: usar subconsultas para evitar producto cartesiano (préstamos × pagos)
     const { rows: porDeudor } = await query(`
       SELECT
-        d.id, d.nombre || ' ' || d.apellidos AS nombre,
-        COALESCE(SUM(p.monto), 0)            AS total_pagado,
-        COALESCE(SUM(pr.monto_original), 0)  AS total_prestado,
-        MAX(p.fecha_pago)                    AS ultimo_pago,
-        COUNT(p.id)                          AS num_pagos
+        d.id,
+        d.nombre || ' ' || d.apellidos AS nombre,
+        (SELECT COALESCE(SUM(p.monto), 0) FROM pagos p WHERE p.deudor_id = d.id) AS total_pagado,
+        (SELECT COALESCE(SUM(pr.monto_original), 0) FROM prestamos pr WHERE pr.deudor_id = d.id) AS total_prestado,
+        (SELECT MAX(p.fecha_pago) FROM pagos p WHERE p.deudor_id = d.id) AS ultimo_pago,
+        (SELECT COUNT(p.id) FROM pagos p WHERE p.deudor_id = d.id) AS num_pagos
       FROM deudores d
-      LEFT JOIN prestamos pr ON pr.deudor_id = d.id
-      LEFT JOIN pagos p      ON p.deudor_id  = d.id
       WHERE d.activo = true
-      GROUP BY d.id ORDER BY d.apellidos
+      ORDER BY d.apellidos
     `);
 
     const { rows: porMetodo } = await query(`
@@ -200,17 +328,16 @@ const resumen = async (req, res) => {
       GROUP BY mes ORDER BY mes DESC LIMIT 12
     `);
 
+    // Totales globales: una suma por tabla, sin JOIN que multiplique filas
     const { rows: [totales] } = await query(`
       SELECT
-        COALESCE(SUM(p.monto), 0)           AS total_cobrado,
-        COALESCE(SUM(pr.monto_original), 0) AS total_prestado
-      FROM pagos p
-      FULL OUTER JOIN prestamos pr ON true
+        (SELECT COALESCE(SUM(monto), 0) FROM pagos) AS total_cobrado,
+        (SELECT COALESCE(SUM(monto_original), 0) FROM prestamos) AS total_prestado
     `);
 
     res.json({ porDeudor, porMetodo, porMes, totales });
   } catch (err) {
-    console.error(err);
+    logger.error({ err });
     res.status(500).json({ error: 'Error al obtener resumen' });
   }
 };
