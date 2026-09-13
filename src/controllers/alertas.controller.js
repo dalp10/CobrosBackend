@@ -66,6 +66,7 @@ const getMora = async (req, res) => {
       JOIN deudores d   ON d.id = pr.deudor_id
       WHERE c.estado IN ('pendiente', 'parcial', 'vencido')
         AND c.fecha_vencimiento < CURRENT_DATE
+        AND d.activo = true
       ORDER BY d.apellidos, d.nombre, c.fecha_vencimiento
     `);
 
@@ -127,6 +128,7 @@ const getProximas = async (req, res) => {
       WHERE c.estado IN ('pendiente', 'parcial')
         AND c.fecha_vencimiento >= CURRENT_DATE
         AND c.fecha_vencimiento <= CURRENT_DATE + $1::int
+        AND d.activo = true
       ORDER BY d.apellidos, d.nombre, c.fecha_vencimiento
     `, [dias]);
 

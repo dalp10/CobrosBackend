@@ -75,10 +75,20 @@ const getById = async (req, res) => {
       SELECT
         pr.*,
         COALESCE(SUM(p.monto), 0) AS total_pagado,
-        COALESCE(
-          (SELECT SUM(c.monto_esperado) FROM cuotas c WHERE c.prestamo_id = pr.id),
-          pr.monto_original
-        ) - COALESCE(SUM(p.monto), 0) AS saldo_pendiente,
+        -- Igual que en prestamos.controller.js: se toma el máximo entre lo que
+        -- dicen las cuotas (monto_pagado) y lo que dice pagos.monto, por si
+        -- divergen en datos históricos/migrados — evita subestimar lo abonado
+        -- o mostrar un pendiente absurdo (mayor al monto total).
+        GREATEST(0,
+          CASE WHEN EXISTS (SELECT 1 FROM cuotas c WHERE c.prestamo_id = pr.id)
+            THEN (SELECT SUM(c.monto_esperado) FROM cuotas c WHERE c.prestamo_id = pr.id)
+                 - GREATEST(
+                     (SELECT SUM(c.monto_pagado) FROM cuotas c WHERE c.prestamo_id = pr.id),
+                     COALESCE(SUM(p.monto), 0)
+                   )
+            ELSE pr.monto_original - COALESCE(SUM(p.monto), 0)
+          END
+        ) AS saldo_pendiente,
         pr.monto_original - (
           SELECT COALESCE(SUM(c.monto_capital * c.monto_pagado / NULLIF(c.monto_esperado, 0)), 0)
           FROM cuotas c WHERE c.prestamo_id = pr.id
@@ -125,10 +135,40 @@ const getById = async (req, res) => {
 
 // POST /deudores
 const create = async (req, res) => {
-  const { nombre, apellidos, dni, telefono, email, direccion, notas, fecha_compromiso_pago, monto_compromiso_pago, notas_compromiso } = req.body;
+  const { nombre, apellidos, dni, telefono, email, direccion, notas, fecha_compromiso_pago, monto_compromiso_pago, notas_compromiso, force } = req.body;
   if (!nombre || !apellidos)
     return res.status(400).json({ error: 'Nombre y apellidos son requeridos' });
   try {
+    // DNI es identificador de persona: si ya está en uso por otro deudor activo,
+    // no se permite crear el duplicado (a diferencia del nombre, que sí puede
+    // coincidir entre personas distintas).
+    if (dni) {
+      const { rows: dniDup } = await query(
+        'SELECT id, nombre, apellidos FROM deudores WHERE activo = true AND dni = $1',
+        [dni]
+      );
+      if (dniDup.length) {
+        return res.status(400).json({
+          error: `Ya existe un deudor activo con el DNI ${dni} (${dniDup[0].nombre} ${dniDup[0].apellidos})`
+        });
+      }
+    }
+    // Mismo nombre + apellidos: solo advertir (puede ser una persona distinta
+    // con el mismo nombre), no bloquear. El caller puede confirmar con force.
+    if (force !== true && force !== 'true') {
+      const { rows: nombreDup } = await query(
+        `SELECT id, nombre, apellidos FROM deudores
+         WHERE activo = true AND LOWER(TRIM(nombre)) = LOWER(TRIM($1)) AND LOWER(TRIM(apellidos)) = LOWER(TRIM($2))`,
+        [nombre, apellidos]
+      );
+      if (nombreDup.length) {
+        return res.status(409).json({
+          error: `Ya existe un deudor activo con el nombre "${nombre} ${apellidos}"`,
+          duplicado: true,
+          deudor_existente: nombreDup[0]
+        });
+      }
+    }
     const { rows: [row] } = await query(`
       INSERT INTO deudores (nombre, apellidos, dni, telefono, email, direccion, notas, fecha_compromiso_pago, monto_compromiso_pago, notas_compromiso)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *

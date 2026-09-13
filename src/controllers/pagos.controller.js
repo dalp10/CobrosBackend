@@ -138,6 +138,12 @@ const create = async (req, res) => {
 
     // El pago no puede exceder el saldo pendiente del préstamo.
     if (prestamo_id) {
+      // Bloquea la fila del préstamo hasta el commit/rollback de esta transacción:
+      // si dos pagos al mismo préstamo llegan en paralelo, el segundo espera a que
+      // el primero termine y así ve su saldo ya actualizado (evita sobre-pago por
+      // condición de carrera entre el SELECT de saldo y el INSERT del pago).
+      await client.query('SELECT id FROM prestamos WHERE id = $1 FOR UPDATE', [prestamo_id]);
+
       const { rows: [{ monto_original, total_pagado }] } = await client.query(`
         SELECT pr.monto_original, COALESCE(SUM(p.monto), 0) AS total_pagado
         FROM prestamos pr
@@ -223,6 +229,8 @@ const update = async (req, res) => {
     if (prestamo_id && !pagoActual.prestamo_id) {
       const montoFinal = monto != null ? parseFloat(monto) : parseFloat(pagoActual.monto);
 
+      await client.query('SELECT id FROM prestamos WHERE id = $1 FOR UPDATE', [prestamo_id]);
+
       const { rows: [{ monto_original, total_pagado }] } = await client.query(`
         SELECT pr.monto_original, COALESCE(SUM(p.monto), 0) AS total_pagado
         FROM prestamos pr
@@ -284,17 +292,54 @@ const update = async (req, res) => {
 };
 
 // DELETE /pagos/:id
+// Deshace en `cuotas` lo que un pago había aplicado (cuotas_aplicadas guarda,
+// por número de cuota, cuánto se le abonó). Sin esto, borrar un pago dejaba
+// la cuota marcada como pagada aunque el pago ya no existiera.
+const revertirPagoDeCuotas = async (client, prestamoId, cuotasAplicadas) => {
+  for (const c of cuotasAplicadas) {
+    const { rows: [cuota] } = await client.query(
+      'SELECT id, monto_esperado, monto_pagado FROM cuotas WHERE prestamo_id = $1 AND numero_cuota = $2',
+      [prestamoId, c.numero_cuota]
+    );
+    if (!cuota) continue;
+    const nuevoPagado = Math.max(0, parseFloat(cuota.monto_pagado) - parseFloat(c.monto_aplicado));
+    const nuevoEstado = nuevoPagado <= 0 ? 'pendiente'
+      : nuevoPagado < parseFloat(cuota.monto_esperado) ? 'parcial'
+      : 'pagado';
+    await client.query(
+      'UPDATE cuotas SET monto_pagado = $1, estado = $2 WHERE id = $3',
+      [nuevoPagado, nuevoEstado, cuota.id]
+    );
+  }
+};
+
 const remove = async (req, res) => {
   const { id } = req.params;
+  const client = await getClient();
   try {
-    const { rows: [pago] } = await query('SELECT imagen_url FROM pagos WHERE id = $1', [id]);
-    if (pago?.imagen_url) tryDeleteUpload(pago.imagen_url);
+    await client.query('BEGIN');
 
-    await query('DELETE FROM pagos WHERE id = $1', [id]);
+    const { rows: [pago] } = await client.query('SELECT * FROM pagos WHERE id = $1', [id]);
+    if (!pago) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Pago no encontrado' });
+    }
+
+    if (pago.prestamo_id && pago.cuotas_aplicadas) {
+      await revertirPagoDeCuotas(client, pago.prestamo_id, pago.cuotas_aplicadas);
+    }
+
+    await client.query('DELETE FROM pagos WHERE id = $1', [id]);
+    await client.query('COMMIT');
+
+    if (pago.imagen_url) tryDeleteUpload(pago.imagen_url);
     res.json({ message: 'Pago eliminado' });
   } catch (err) {
+    await client.query('ROLLBACK');
     logger.error({ err });
     res.status(500).json({ error: 'Error al eliminar pago' });
+  } finally {
+    client.release();
   }
 };
 
@@ -320,12 +365,16 @@ const resumen = async (req, res) => {
       FROM pagos GROUP BY metodo_pago ORDER BY total DESC
     `);
 
+    // Sin LIMIT: el frontend recibe el historial completo y es quien recorta
+    // por rango (3/6/12/todos los meses) en porMesFiltrado(). Limitar aquí a 12
+    // rompía la opción "Todos" (mostraba solo los últimos 12 meses igual,
+    // sin avisar, aunque hubiera más historial).
     const { rows: porMes } = await query(`
       SELECT
         TO_CHAR(fecha_pago, 'YYYY-MM') AS mes,
         SUM(monto) AS total, COUNT(*) AS pagos
       FROM pagos
-      GROUP BY mes ORDER BY mes DESC LIMIT 12
+      GROUP BY mes ORDER BY mes DESC
     `);
 
     // Totales globales: una suma por tabla, sin JOIN que multiplique filas

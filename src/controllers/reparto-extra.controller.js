@@ -298,6 +298,9 @@ const exportarReporteExcel = async (req, res) => {
 };
 
 /** POST /api/reparto/gastos/:id/repetir-mes */
+// Copia también participantes y cargos del gasto original: si no se repartía
+// entre todos por igual, o tenía cargos adicionales (ej. aire acondicionado),
+// el gasto repetido debe mantener esa misma configuración.
 const repetirGastoMes = async (req, res) => {
   const { id } = req.params;
   try {
@@ -314,6 +317,29 @@ const repetirGastoMes = async (req, res) => {
       VALUES ($1, $2, $3::date, $4, $5, $6, $7, true, $8)
       RETURNING *
     `, [gasto.concepto, gasto.monto_total, fechaStr, gasto.pagado_por_id, gasto.notas, gasto.categoria_id, gasto.reparto_id || 1, id]);
+
+    const { rows: participantes } = await query(
+      'SELECT miembro_id, peso FROM reparto_gasto_participantes WHERE gasto_id = $1',
+      [id]
+    );
+    for (const p of participantes) {
+      await query(
+        'INSERT INTO reparto_gasto_participantes (gasto_id, miembro_id, peso) VALUES ($1, $2, $3)',
+        [row.id, p.miembro_id, p.peso]
+      );
+    }
+
+    const { rows: cargos } = await query(
+      'SELECT miembro_id, monto FROM reparto_gasto_cargos WHERE gasto_id = $1',
+      [id]
+    );
+    for (const c of cargos) {
+      await query(
+        'INSERT INTO reparto_gasto_cargos (gasto_id, miembro_id, monto) VALUES ($1, $2, $3)',
+        [row.id, c.miembro_id, c.monto]
+      );
+    }
+
     res.status(201).json(row);
   } catch (err) {
     logger.error({ err });

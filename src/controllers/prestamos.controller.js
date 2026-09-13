@@ -2,6 +2,7 @@
 const { query, getClient } = require('../config/db');
 const logger = require('../config/logger');
 const { calcularCronograma } = require('../utils/amortizacion');
+const { addMonthsIso } = require('../utils/fechas');
 
 // GET /prestamos?deudor_id=
 const getAll = async (req, res) => {
@@ -12,10 +13,25 @@ const getAll = async (req, res) => {
         pr.*,
         d.nombre || ' ' || d.apellidos AS deudor_nombre,
         COALESCE(SUM(p.monto), 0)      AS total_pagado,
-        COALESCE(
-          (SELECT SUM(c.monto_esperado) FROM cuotas c WHERE c.prestamo_id = pr.id),
-          pr.monto_original
-        ) - COALESCE(SUM(p.monto), 0) AS saldo_pendiente,
+        -- Idealmente SUM(cuotas.monto_pagado) == SUM(pagos.monto) para un mismo
+        -- préstamo (aplicarPagoACuotas mantiene ambas en sync), pero en datos
+        -- históricos/migrados pueden divergir en cualquier dirección: un pago
+        -- reflejado en cuotas sin fila en pagos, o viceversa. Usar solo una
+        -- de las dos fuentes puede subestimar lo abonado (mostrando de más
+        -- pendiente) o directamente dar un pendiente absurdo (mayor al monto
+        -- total). Se toma el máximo de ambas para no penalizar al deudor por
+        -- una fuente incompleta, acotado a nunca superar lo esperado ni bajar
+        -- de 0.
+        GREATEST(0,
+          CASE WHEN EXISTS (SELECT 1 FROM cuotas c WHERE c.prestamo_id = pr.id)
+            THEN (SELECT SUM(c.monto_esperado) FROM cuotas c WHERE c.prestamo_id = pr.id)
+                 - GREATEST(
+                     (SELECT SUM(c.monto_pagado) FROM cuotas c WHERE c.prestamo_id = pr.id),
+                     COALESCE(SUM(p.monto), 0)
+                   )
+            ELSE pr.monto_original - COALESCE(SUM(p.monto), 0)
+          END
+        ) AS saldo_pendiente,
         (SELECT COUNT(*) FROM cuotas c WHERE c.prestamo_id = pr.id AND c.estado = 'pagado')  AS cuotas_pagadas,
         (SELECT COUNT(*) FROM cuotas c WHERE c.prestamo_id = pr.id AND c.estado != 'pagado') AS cuotas_pendientes,
         pr.monto_original - (
@@ -77,7 +93,13 @@ const getById = async (req, res) => {
       ? cuotas.reduce((s, c) => s + parseFloat(c.monto_esperado), 0)
       : parseFloat(prestamo.monto_original);
     const total_pagado = pagos.reduce((s, p) => s + parseFloat(p.monto), 0);
-    const saldo_pendiente = montoTotalEsperado - total_pagado;
+    // Igual que en getAll(): se toma el máximo entre lo que dicen las cuotas
+    // (monto_pagado) y lo que dice pagos.monto, por si divergen en datos
+    // históricos — evita subestimar lo abonado o mostrar un pendiente absurdo.
+    const cuotasPagadoSum = cuotas.reduce((s, c) => s + parseFloat(c.monto_pagado || 0), 0);
+    const saldo_pendiente = Math.max(0, cuotas.length
+      ? montoTotalEsperado - Math.max(cuotasPagadoSum, total_pagado)
+      : montoTotalEsperado - total_pagado);
 
     res.json({ ...prestamo, total_pagado, saldo_pendiente, saldo_capital, interes_total: interesTotal, interes_pagado: interesPagado, cuotas, pagos });
   } catch (err) {
@@ -86,6 +108,11 @@ const getById = async (req, res) => {
 };
 
 // POST /prestamos
+// Si se indica cuota_mensual y/o más de 1 cuota, genera de una vez el cronograma
+// de cuotas (igual que reprogramar), para que el préstamo aparezca desde el
+// inicio en mora/alertas/próximas a vencer. Un préstamo "simple" (1 cuota,
+// sin cuota_mensual) se deja sin cronograma, como un saldo informal que se
+// abona sin plan fijo — igual que hasta ahora.
 const create = async (req, res) => {
   const {
     deudor_id, tipo, descripcion, monto_original, tasa_interes,
@@ -96,21 +123,61 @@ const create = async (req, res) => {
   if (!deudor_id || !tipo || !monto_original || !fecha_inicio)
     return res.status(400).json({ error: 'Faltan campos requeridos' });
 
+  const montoOriginalNum = parseFloat(monto_original);
+  const totalCuotasNum = parseInt(total_cuotas, 10) || 1;
+  const cuotaMensualNum = cuota_mensual ? parseFloat(cuota_mensual) : null;
+  const generarCronograma = totalCuotasNum > 1 || !!cuotaMensualNum;
+
+  const client = await getClient();
   try {
-    const { rows: [row] } = await query(`
+    await client.query('BEGIN');
+
+    const { rows: [row] } = await client.query(`
       INSERT INTO prestamos
         (deudor_id, tipo, descripcion, monto_original, tasa_interes,
          total_cuotas, cuota_mensual, fecha_inicio, fecha_fin,
          banco, numero_operacion, notas)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       RETURNING *
-    `, [deudor_id, tipo, descripcion, monto_original, tasa_interes||0,
-        total_cuotas||1, cuota_mensual||null, fecha_inicio, fecha_fin||null,
+    `, [deudor_id, tipo, descripcion, montoOriginalNum, tasa_interes||0,
+        totalCuotasNum, cuotaMensualNum, fecha_inicio, fecha_fin||null,
         banco||null, numero_operacion||null, notas||null]);
-    res.status(201).json(row);
+
+    let cuotas = [];
+    if (generarCronograma) {
+      const cuotaMensualFinal = cuotaMensualNum || Math.round((montoOriginalNum / totalCuotasNum) * 100) / 100;
+      const nuevasCuotas = [];
+      for (let i = 0; i < totalCuotasNum; i++) {
+        const esUltima = i === totalCuotasNum - 1;
+        const monto = esUltima
+          ? Math.max(0, montoOriginalNum - cuotaMensualFinal * (totalCuotasNum - 1))
+          : cuotaMensualFinal;
+        nuevasCuotas.push({
+          numero_cuota: i + 1,
+          fecha_vencimiento: addMonthsIso(fecha_inicio, i),
+          monto_esperado: Math.round(monto * 100) / 100
+        });
+      }
+
+      const cuotasConSplit = calcularCronograma(nuevasCuotas, montoOriginalNum, tasa_interes || 0);
+      for (const c of cuotasConSplit) {
+        await client.query(
+          `INSERT INTO cuotas (prestamo_id, numero_cuota, fecha_vencimiento, monto_esperado, monto_pagado, estado, monto_capital, monto_interes)
+           VALUES ($1, $2, $3, $4, 0, 'pendiente', $5, $6)`,
+          [row.id, c.numero_cuota, c.fecha_vencimiento, c.monto_esperado, c.monto_capital, c.monto_interes]
+        );
+      }
+      cuotas = cuotasConSplit;
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ ...row, cuotas });
   } catch (err) {
+    await client.query('ROLLBACK');
     logger.error({ err });
     res.status(500).json({ error: 'Error al crear préstamo' });
+  } finally {
+    client.release();
   }
 };
 
@@ -154,6 +221,21 @@ const update = async (req, res) => {
     return res.status(400).json({ error: 'No se enviaron campos para actualizar' });
   updates.push(`updated_at = NOW()`);
   try {
+    // Si el préstamo ya tiene un cronograma de cuotas, cambiar monto_original aquí
+    // dejaría el total de las cuotas (y por lo tanto saldo_pendiente/saldo_capital)
+    // desincronizado del nuevo monto. Para ese caso, el camino correcto es
+    // "Reprogramar cronograma", que sí recalcula las cuotas pendientes.
+    if (req.body.monto_original !== undefined && req.body.monto_original !== null) {
+      const { rows: [{ count }] } = await query(
+        'SELECT COUNT(*) FROM cuotas WHERE prestamo_id = $1', [id]
+      );
+      if (parseInt(count, 10) > 0) {
+        return res.status(400).json({
+          error: 'Este préstamo ya tiene un cronograma de cuotas. Para cambiar el monto usa "Reprogramar cronograma" en vez de editar el monto directamente.'
+        });
+      }
+    }
+
     const { rows: [row] } = await query(
       `UPDATE prestamos SET ${updates.join(', ')} WHERE id = $${i} RETURNING *`,
       [...values, id]
@@ -219,16 +301,15 @@ const reprogramar = async (req, res) => {
 
     await client.query(`DELETE FROM cuotas WHERE prestamo_id = $1 AND estado != 'pagado'`, [id]);
 
-    let fechaBase;
+    let fechaBaseIso;
     if (fecha_inicio) {
-      fechaBase = new Date(fecha_inicio);
+      fechaBaseIso = fecha_inicio;
     } else if (cuotasPagadas.length) {
-      fechaBase = new Date(cuotasPagadas[cuotasPagadas.length - 1].fecha_vencimiento);
-      fechaBase.setMonth(fechaBase.getMonth() + 1);
+      fechaBaseIso = addMonthsIso(cuotasPagadas[cuotasPagadas.length - 1].fecha_vencimiento, 1);
     } else if (cuotasPendientes.length) {
-      fechaBase = new Date(cuotasPendientes[0].fecha_vencimiento);
+      fechaBaseIso = cuotasPendientes[0].fecha_vencimiento;
     } else {
-      fechaBase = new Date(prestamo.fecha_inicio);
+      fechaBaseIso = prestamo.fecha_inicio;
     }
 
     const n = parseInt(total_cuotas, 10);
@@ -237,13 +318,11 @@ const reprogramar = async (req, res) => {
 
     const nuevasCuotas = [];
     for (let i = 0; i < n; i++) {
-      const fecha = new Date(fechaBase);
-      fecha.setMonth(fecha.getMonth() + i);
       const esUltima = i === n - 1;
       const monto = esUltima ? Math.max(0, saldoPendiente - cuotaMensual * (n - 1)) : cuotaMensual;
       nuevasCuotas.push({
         numero_cuota: numeroInicial + i,
-        fecha_vencimiento: fecha.toISOString().split('T')[0],
+        fecha_vencimiento: addMonthsIso(fechaBaseIso, i),
         monto_esperado: Math.round(monto * 100) / 100
       });
     }
