@@ -14,6 +14,7 @@ const { ensureEnv } = require('./config/env');
 const { checkDb } = require('./config/health');
 const { pgErrorToHttp } = require('./utils/pgErrors');
 const logger = require('./config/logger');
+const staticAuth = require('./middleware/staticAuth');
 
 ensureEnv();
 
@@ -62,9 +63,9 @@ app.use('/api', (req, res, next) => {
   return apiLimiter(req, res, next);
 });
 
-// Servir archivos subidos (vouchers/imágenes)
+// Servir archivos subidos (vouchers/imágenes) — requiere token (header o ?token=)
 const uploadsDir = process.env.UPLOADS_DIR || './uploads';
-app.use('/uploads', express.static(path.resolve(uploadsDir)));
+app.use('/uploads', staticAuth, express.static(path.resolve(uploadsDir)));
 
 // ── Documentación API (Swagger) ─────────────────────────────────
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));

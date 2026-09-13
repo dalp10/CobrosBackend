@@ -47,6 +47,11 @@ const login = async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: 'Credenciales inválidas' });
 
+    // Verificar contraseña antes que activo: así no se revela el estado de la
+    // cuenta a quien no conoce la contraseña correcta.
+    if (user.activo === false)
+      return res.status(403).json({ error: 'Esta cuenta está desactivada', code: 'USER_INACTIVE' });
+
     const token = signAccessToken(user);
     res.cookie(REFRESH_COOKIE, signRefreshToken(user), refreshCookieOptions);
 

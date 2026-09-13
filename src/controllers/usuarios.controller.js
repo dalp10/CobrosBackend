@@ -43,9 +43,11 @@ const create = async (req, res) => {
     if (existe.rows.length)
       return res.status(400).json({ error: 'El email ya está registrado' });
     const hash = await bcrypt.hash(password, 10);
+    // Rol de menor privilegio por defecto si no se especifica: evita que un
+    // bug o una llamada directa al API otorgue admin sin querer.
     const { rows: [user] } = await query(
       'INSERT INTO usuarios (nombre, email, password, rol) VALUES ($1,$2,$3,$4) RETURNING id, nombre, email, rol',
-      [nombre, email, hash, rol || 'admin']
+      [nombre, email, hash, rol || 'usuario']
     );
     res.status(201).json(user);
   } catch (err) {
@@ -66,14 +68,14 @@ const update = async (req, res) => {
     try {
       const r = await query(
         'UPDATE usuarios SET nombre=$1, email=$2, rol=$3, activo=$4 WHERE id=$5 RETURNING id, nombre, email, rol, activo, created_at',
-        [nombre, email, rol || 'admin', activo !== undefined ? activo : true, id]
+        [nombre, email, rol || 'usuario', activo !== undefined ? activo : true, id]
       );
       user = r.rows[0];
     } catch (colErr) {
       if (colErr.code === '42703') {
         const r = await query(
           'UPDATE usuarios SET nombre=$1, email=$2, rol=$3 WHERE id=$4 RETURNING id, nombre, email, rol, created_at',
-          [nombre, email, rol || 'admin', id]
+          [nombre, email, rol || 'usuario', id]
         );
         user = r.rows[0] ? { ...r.rows[0], activo: activo !== undefined ? activo : true } : null;
       } else {
