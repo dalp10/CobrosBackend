@@ -985,4 +985,7 @@ module.exports = {
   updateReembolso,
   deleteReembolso,
   exportarReporte,
+  // Exportadas también para poder testearlas de forma aislada (lógica pura sin DB).
+  calcularCuotaPorMiembro,
+  calcularSugerenciasReembolso,
 };
