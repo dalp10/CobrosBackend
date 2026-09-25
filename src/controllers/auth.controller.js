@@ -1,11 +1,18 @@
 // src/controllers/auth.controller.js
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const logger = require('../config/logger');
 const jwt = require('jsonwebtoken');
 const { query } = require('../config/db');
+const { sendEmail } = require('../services/email.service');
 
 const REFRESH_COOKIE = 'refreshToken';
 const isProduction = process.env.NODE_ENV === 'production';
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
+
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
 
 const refreshCookieOptions = {
   httpOnly: true,
@@ -116,4 +123,67 @@ const me = async (req, res) => {
   }
 };
 
-module.exports = { login, refresh, logout, me };
+// POST /auth/forgot-password — body: { email }
+// Siempre responde el mismo mensaje genérico, exista o no ese email, para no
+// permitir enumerar qué correos están registrados en el sistema.
+const GENERIC_FORGOT_MESSAGE = 'Si el email está registrado, se enviaron instrucciones para restablecer la contraseña.';
+
+const forgotPassword = async (req, res) => {
+  const { email } = req.body;
+  try {
+    const { rows } = await query('SELECT id, nombre, email, activo FROM usuarios WHERE email = $1', [email]);
+    const user = rows[0];
+    if (user && user.activo !== false) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashToken(token);
+      const expira = new Date(Date.now() + RESET_TOKEN_TTL_MS);
+      await query(
+        'UPDATE usuarios SET reset_token_hash = $1, reset_token_expira = $2 WHERE id = $3',
+        [tokenHash, expira, user.id]
+      );
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:4200';
+      const resetUrl = `${frontendUrl.replace(/\/$/, '')}/reset-password?token=${token}`;
+      const result = await sendEmail(
+        user.email,
+        'Restablecer tu contraseña — Cobros App',
+        `<p>Hola ${user.nombre},</p>
+         <p>Recibimos una solicitud para restablecer tu contraseña. Este enlace es válido por 1 hora:</p>
+         <p><a href="${resetUrl}">${resetUrl}</a></p>
+         <p>Si no solicitaste esto, puedes ignorar este correo.</p>`
+      );
+      if (!result.ok) logger.error({ error: result.error, code: result.code }, 'No se pudo enviar el email de recuperación');
+    }
+    res.json({ message: GENERIC_FORGOT_MESSAGE });
+  } catch (err) {
+    logger.error({ err });
+    // Ante un error inesperado, igual se responde el mensaje genérico: no hay
+    // forma de distinguir "email no existe" de "fallo interno" sin filtrar info.
+    res.json({ message: GENERIC_FORGOT_MESSAGE });
+  }
+};
+
+// POST /auth/reset-password — body: { token, password_nuevo }
+const resetPassword = async (req, res) => {
+  const { token, password_nuevo } = req.body;
+  try {
+    const tokenHash = hashToken(token);
+    const { rows } = await query(
+      'SELECT id FROM usuarios WHERE reset_token_hash = $1 AND reset_token_expira > NOW()',
+      [tokenHash]
+    );
+    if (!rows.length)
+      return res.status(400).json({ error: 'El enlace de recuperación es inválido o expiró', code: 'RESET_TOKEN_INVALID' });
+
+    const hash = await bcrypt.hash(password_nuevo, 10);
+    await query(
+      'UPDATE usuarios SET password = $1, reset_token_hash = NULL, reset_token_expira = NULL WHERE id = $2',
+      [hash, rows[0].id]
+    );
+    res.json({ message: 'Contraseña actualizada. Ya puedes iniciar sesión.' });
+  } catch (err) {
+    logger.error({ err });
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+};
+
+module.exports = { login, refresh, logout, me, forgotPassword, resetPassword };

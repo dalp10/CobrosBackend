@@ -30,6 +30,13 @@ const createTables = async () => {
     await client.query(`
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT true;
     `);
+    // Recuperación de contraseña: se guarda el hash del token (no el token en sí,
+    // igual que la contraseña) y su expiración. Ambos se limpian al usarse o al
+    // pedir un nuevo reset, así un token nunca es reutilizable.
+    await client.query(`
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_token_hash VARCHAR(64);
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_token_expira TIMESTAMPTZ;
+    `);
 
     // ── DEUDORES ─────────────────────────────────────────────────
     await client.query(`

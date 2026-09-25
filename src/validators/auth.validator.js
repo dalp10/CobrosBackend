@@ -13,4 +13,22 @@ const loginValidations = [
     .withMessage('Contraseña requerida'),
 ];
 
-module.exports = { loginValidations };
+const forgotPasswordValidations = [
+  body('email')
+    .trim()
+    .notEmpty()
+    .withMessage('Email requerido')
+    .isEmail()
+    .withMessage('Email inválido'),
+];
+
+const resetPasswordValidations = [
+  body('token')
+    .notEmpty()
+    .withMessage('Token requerido'),
+  body('password_nuevo')
+    .isLength({ min: 6 })
+    .withMessage('La nueva contraseña debe tener al menos 6 caracteres'),
+];
+
+module.exports = { loginValidations, forgotPasswordValidations, resetPasswordValidations };
